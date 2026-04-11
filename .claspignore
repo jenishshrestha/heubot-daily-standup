@@ -1,0 +1,10 @@
+# Only the .gs files and appsscript.json should ship to Apps Script.
+# Everything else stays local.
+
+**/**
+!Code.gs
+!Admin.gs
+!Card.gs
+!Database.gs
+!Jira.gs
+!appsscript.json

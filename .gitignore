@@ -1,0 +1,14 @@
+# clasp credentials — script ID + auth token, never commit
+.clasp.json
+.clasprc.json
+
+# bun (commit bun.lock for reproducible installs; only ignore node_modules)
+node_modules/
+
+# editor / OS noise
+.DS_Store
+.vscode/
+.idea/
+
+# logs
+*.log
