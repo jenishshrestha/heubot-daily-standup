@@ -2,6 +2,10 @@
 .clasp.json
 .clasprc.json
 
+# Service account JSON keys — bot identity credential, never commit
+heubot-*.json
+*-service-account*.json
+
 # bun (commit bun.lock for reproducible installs; only ignore node_modules)
 node_modules/
 

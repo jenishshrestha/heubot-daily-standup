@@ -15,17 +15,31 @@
 
 /**
  * Builds a standup form card dynamically from questions in the DB.
- * @param {Array<Object>} questions - Array of { id, sort_order, question, required }
- * @param {string} dateLabel - Display date, e.g. "April 11, 2026"
+ *
+ * The Submit button embeds the meeting date as an action parameter so
+ * `handleStandupSubmit` upserts the response under the correct date —
+ * works for both "today's meeting" pre-submissions and explicit-date
+ * backfills via `/standup YYYY-MM-DD`.
+ *
+ * If `existingAnswers` is provided, the card behaves as an EDIT form:
+ * each text input is pre-filled with the saved value, the subtitle
+ * changes to "Edit your standup", and the submit button reads "Update
+ * Standup". Members can edit their submission any time before the
+ * morning digest because `handleStandupSubmit` upserts on (date, email).
+ *
+ * @param {Array<Object>} questions       - { id, sort_order, question, required }
+ * @param {string} dateLabel              - Display date, e.g. "Monday, April 13, 2026"
+ * @param {string} standupDate            - YYYY-MM-DD meeting date this form is for
+ * @param {Object} [existingAnswers]      - Map of "question_<id>" → string, from a prior submission
  * @returns {Object} Google Chat Cards v2 message
  */
-function buildStandupCard(questions, dateLabel) {
+function buildStandupCard(questions, dateLabel, standupDate, existingAnswers) {
+  var isEditing = !!(existingAnswers && Object.keys(existingAnswers).length > 0);
   var widgets = [];
 
-  // Header info
   widgets.push({
     decoratedText: {
-      topLabel: 'Standup for Tomorrow',
+      topLabel: 'Standup for',
       text: dateLabel,
       startIcon: { knownIcon: 'DESCRIPTION' }
     }
@@ -33,32 +47,39 @@ function buildStandupCard(questions, dateLabel) {
 
   widgets.push({ divider: {} });
 
-  // Dynamic question fields
   questions.forEach(function(q) {
-    widgets.push({
-      textInput: {
-        label: q.question,
-        type: 'MULTIPLE_LINE',
-        name: 'question_' + q.id,
-        hintText: q.required ? 'Required' : 'Optional'
-      }
-    });
+    var inputKey = 'question_' + q.id;
+    var input = {
+      label: q.question,
+      type: 'MULTIPLE_LINE',
+      name: inputKey,
+      hintText: q.required ? 'Required' : 'Optional'
+    };
+    if (existingAnswers && existingAnswers[inputKey]) {
+      input.value = existingAnswers[inputKey];
+    }
+    widgets.push({ textInput: input });
   });
 
   widgets.push({ divider: {} });
 
-  // Submit button
   widgets.push({
     buttonList: {
       buttons: [{
-        text: 'Submit Standup',
+        text: isEditing ? 'Update Standup' : 'Submit Standup',
         onClick: {
           action: {
             function: 'handleStandupSubmit',
-            parameters: [{
-              key: 'questionIds',
-              value: questions.map(function(q) { return q.id; }).join(',')
-            }]
+            parameters: [
+              {
+                key: 'questionIds',
+                value: questions.map(function(q) { return q.id; }).join(',')
+              },
+              {
+                key: 'standupDate',
+                value: standupDate || ''
+              }
+            ]
           }
         },
         color: {
@@ -77,8 +98,84 @@ function buildStandupCard(questions, dateLabel) {
       card: {
         header: {
           title: 'Heubot',
-          subtitle: 'Daily Standup',
+          subtitle: isEditing ? 'Edit your standup' : 'Daily Standup',
           imageUrl: 'https://fonts.gstatic.com/s/i/short-term/release/googlesymbols/checklist/default/48px.svg',
+          imageType: 'CIRCLE'
+        },
+        sections: [{ widgets: widgets }]
+      }
+    }]
+  };
+}
+
+/**
+ * Builds the small notification card sent at PROMPT_TIME to nudge each
+ * member to fill their standup. The "Fill Standup" button transforms
+ * the notification into the full form (via `handleShowStandupForm`)
+ * without leaving the chat — no need to type `/standup` manually.
+ *
+ * When `opts.broadcastNote` is set, an italic footer line is appended
+ * (e.g. "Notified 14 other team members."). This lets the same card
+ * serve double duty as both the personal nudge and the response to
+ * `/notify-all` for the admin who triggered the broadcast.
+ *
+ * @param {string} dateLabel     - Display date for the upcoming meeting
+ * @param {string} standupDate   - YYYY-MM-DD for that meeting
+ * @param {Object} [opts]
+ * @param {string} [opts.broadcastNote] - Optional footer text shown in italics
+ * @returns {Object} Google Chat Cards v2 message
+ */
+function buildStandupNotificationCard(dateLabel, standupDate, opts) {
+  opts = opts || {};
+
+  var widgets = [
+    {
+      decoratedText: {
+        topLabel: 'Standup for',
+        text: dateLabel,
+        startIcon: { knownIcon: 'DESCRIPTION' },
+        wrapText: true
+      }
+    },
+    {
+      textParagraph: {
+        text: 'Tap <b>Fill Standup</b> below, or run <code>/standup</code> any time before tomorrow morning\'s digest.'
+      }
+    },
+    {
+      buttonList: {
+        buttons: [{
+          text: 'Fill Standup',
+          onClick: {
+            action: {
+              function: 'handleShowStandupForm',
+              parameters: [{
+                key: 'standupDate',
+                value: standupDate || ''
+              }]
+            }
+          },
+          color: { red: 0.0, green: 0.53, blue: 0.33, alpha: 1.0 }
+        }]
+      }
+    }
+  ];
+
+  if (opts.broadcastNote) {
+    widgets.push({ divider: {} });
+    widgets.push({
+      textParagraph: { text: '<i>' + opts.broadcastNote + '</i>' }
+    });
+  }
+
+  return {
+    cardsV2: [{
+      cardId: 'standup-notification',
+      card: {
+        header: {
+          title: 'Heubot',
+          subtitle: 'Time to fill your standup',
+          imageUrl: 'https://fonts.gstatic.com/s/i/short-term/release/googlesymbols/notifications/default/48px.svg',
           imageType: 'CIRCLE'
         },
         sections: [{ widgets: widgets }]
@@ -155,75 +252,82 @@ function buildReminderCard() {
 }
 
 // ---------------------------------------------------------------------------
-// Digest Card (posted to team space)
+// Digest Cards (posted to team space)
+//
+// The digest is posted in two parts:
+//   1. A small SUMMARY card as the main message in the team space
+//      (response count + responders + non-responders).
+//   2. One per-person REPLY card per response, posted as a thread reply
+//      under the summary message.
+//
+// This keeps the channel uncluttered (one main message visible in the
+// channel feed) while letting anyone expand the thread to read each
+// person's standup individually. Modeled on DailyBot's pattern.
 // ---------------------------------------------------------------------------
 
 /**
- * Builds the daily digest card with per-person sections.
- * @param {Array<Object>} responses - Today's standup responses
- * @param {Array<Object>} questions - Questions list (for labels)
- * @param {Array<string>} nonResponders - Names of people who didn't respond
- * @param {string} dateLabel - Display date
+ * Builds the small summary card that opens the digest thread. Contains
+ * just the response counts and lists of responders / non-responders.
+ *
+ * @param {Array<Object>} responders     - Array of { name } that submitted
+ * @param {Array<string>} nonResponders  - Names of people who didn't respond
+ * @param {string} dateLabel             - Display date for the meeting
  * @returns {Object} Google Chat Cards v2 message
  */
-function buildDigestCard(responses, questions, nonResponders, dateLabel) {
-  var sections = [];
+function buildDigestSummaryCard(responders, nonResponders, dateLabel) {
+  var totalCount = responders.length + nonResponders.length;
+  var widgets = [];
 
-  // Per-person sections
-  responses.forEach(function(resp) {
-    var widgets = [];
-
-    // Answers
-    questions.forEach(function(q) {
-      var answer = resp.answers['question_' + q.id] || 'No response';
-      widgets.push({
-        decoratedText: {
-          topLabel: q.question,
-          text: answer,
-          wrapText: true
-        }
-      });
-    });
-
-    // Jira tickets
-    if (resp.jira_tickets && resp.jira_tickets.length > 0) {
-      widgets.push({ divider: {} });
-      widgets.push({
-        decoratedText: {
-          topLabel: 'Jira Tickets',
-          text: resp.jira_tickets.map(function(t) {
-            return getStatusEmoji(t.status) + ' <b>' + t.key + '</b> ' + t.summary + ' [' + t.status + ']';
-          }).join('\n'),
-          wrapText: true
-        }
-      });
+  widgets.push({
+    decoratedText: {
+      topLabel: 'Daily Standup',
+      text: dateLabel,
+      startIcon: { knownIcon: 'DESCRIPTION' },
+      wrapText: true
     }
-
-    sections.push({
-      header: resp.name,
-      widgets: widgets,
-      collapsible: true,
-      uncollapsibleWidgetsCount: 1
-    });
   });
 
-  // Non-responders section
+  widgets.push({
+    decoratedText: {
+      topLabel: 'Responses',
+      text: '<b>' + responders.length + '</b> of ' + totalCount + ' members',
+      startIcon: { knownIcon: 'STAR' },
+      wrapText: true
+    }
+  });
+
+  if (responders.length > 0) {
+    widgets.push({
+      decoratedText: {
+        topLabel: 'Responded',
+        text: responders.map(function(r) { return r.name; }).join(', '),
+        wrapText: true
+      }
+    });
+  }
+
   if (nonResponders.length > 0) {
-    sections.push({
-      widgets: [{
-        decoratedText: {
-          topLabel: 'No Response',
-          text: nonResponders.join(', '),
-          startIcon: { knownIcon: 'PERSON' },
-          wrapText: true
-        }
-      }]
+    widgets.push({
+      decoratedText: {
+        topLabel: 'No Response',
+        text: nonResponders.join(', '),
+        startIcon: { knownIcon: 'PERSON' },
+        wrapText: true
+      }
+    });
+  }
+
+  if (responders.length > 0) {
+    widgets.push({
+      textParagraph: {
+        text: '<i>Open the thread to read each member\'s update.</i>'
+      }
     });
   }
 
   return {
     cardsV2: [{
-      cardId: 'standup-digest',
+      cardId: 'standup-digest-summary',
       card: {
         header: {
           title: 'Heubot — Daily Standup',
@@ -231,7 +335,58 @@ function buildDigestCard(responses, questions, nonResponders, dateLabel) {
           imageUrl: 'https://fonts.gstatic.com/s/i/short-term/release/googlesymbols/summarize/default/48px.svg',
           imageType: 'CIRCLE'
         },
-        sections: sections
+        sections: [{ widgets: widgets }]
+      }
+    }]
+  };
+}
+
+/**
+ * Builds a per-person reply card containing one member's standup
+ * answers and Jira tickets. Posted as a thread reply under the summary
+ * card via `botMessageCreateInThread`.
+ *
+ * @param {Object} response   - { name, email, answers, jira_tickets, ... }
+ * @param {Array<Object>} questions - Question list (for labels)
+ * @returns {Object} Google Chat Cards v2 message
+ */
+function buildDigestReplyCard(response, questions) {
+  var widgets = [];
+
+  questions.forEach(function(q) {
+    var answer = response.answers['question_' + q.id] || '<i>No response</i>';
+    widgets.push({
+      decoratedText: {
+        topLabel: q.question,
+        text: answer,
+        wrapText: true
+      }
+    });
+  });
+
+  if (response.jira_tickets && response.jira_tickets.length > 0) {
+    widgets.push({ divider: {} });
+    widgets.push({
+      decoratedText: {
+        topLabel: 'Jira Tickets',
+        text: response.jira_tickets.map(function(t) {
+          return getStatusEmoji(t.status) + ' <b>' + t.key + '</b> ' + t.summary + ' [' + t.status + ']';
+        }).join('\n'),
+        wrapText: true
+      }
+    });
+  }
+
+  return {
+    cardsV2: [{
+      cardId: 'standup-digest-reply',
+      card: {
+        header: {
+          title: response.name,
+          imageUrl: 'https://fonts.gstatic.com/s/i/short-term/release/googlesymbols/account_circle/default/48px.svg',
+          imageType: 'CIRCLE'
+        },
+        sections: [{ widgets: widgets }]
       }
     }]
   };
@@ -329,7 +484,7 @@ function buildScheduleDialog(settings) {
                 label: 'Digest time (HH:MM, 24h)',
                 type: 'SINGLE_LINE',
                 name: 'digest_time',
-                value: settings['DIGEST_TIME'] || '17:30'
+                value: settings['DIGEST_TIME'] || '09:00'
               }
             },
             { divider: {} },
@@ -602,12 +757,15 @@ function buildTextCard(title, message) {
 }
 
 /**
- * Builds the today's status card.
+ * Builds the standup status card.
  * @param {Array<Object>} responded - People who responded
  * @param {Array<Object>} pending - People who haven't responded
+ * @param {string} [meetingLabel] - Human label for the meeting being reported on
+ *                                  (e.g. "Tuesday, January 14, 2026"). Shown as the
+ *                                  card subtitle so admins know which meeting this is.
  * @returns {Object} Google Chat Cards v2 message
  */
-function buildStatusCard(responded, pending) {
+function buildStatusCard(responded, pending, meetingLabel) {
   var widgets = [];
 
   if (responded.length > 0) {
@@ -634,17 +792,21 @@ function buildStatusCard(responded, pending) {
 
   if (responded.length === 0 && pending.length === 0) {
     widgets.push({
-      textParagraph: { text: 'No standup data for today yet.' }
+      textParagraph: { text: 'No standup responses recorded for this meeting yet.' }
     });
   }
+
+  var subtitle = meetingLabel
+    ? meetingLabel + ' — ' + responded.length + ' responded, ' + pending.length + ' pending'
+    : responded.length + ' responded, ' + pending.length + ' pending';
 
   return {
     cardsV2: [{
       cardId: 'admin-status',
       card: {
         header: {
-          title: 'Heubot — Today\'s Status',
-          subtitle: responded.length + ' responded, ' + pending.length + ' pending',
+          title: 'Heubot — Standup Status',
+          subtitle: subtitle,
           imageUrl: 'https://fonts.gstatic.com/s/i/short-term/release/googlesymbols/monitoring/default/48px.svg',
           imageType: 'CIRCLE'
         },

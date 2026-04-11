@@ -2,7 +2,7 @@
  * Code.gs — Main entry points for Heubot
  *
  * Handles:
- * - sendStandupCards()   — DM standup form to each team member
+ * - sendStandupNotifications() — DM small notification card to each member
  * - onCardClick(event)   — Route card button clicks
  * - onMessage(event)     — Route slash commands (delegates to Admin.gs)
  * - sendReminders()      — Remind non-responders
@@ -20,16 +20,88 @@ function getTodayDate() {
   return Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd');
 }
 
-function getTomorrowDateLabel() {
-  var tz = getSetting('TIMEZONE') || 'Asia/Kathmandu';
-  var tomorrow = new Date();
-  tomorrow.setDate(tomorrow.getDate() + 1);
-  return Utilities.formatDate(tomorrow, tz, 'MMMM d, yyyy');
-}
-
 function getTodayDateLabel() {
   var tz = getSetting('TIMEZONE') || 'Asia/Kathmandu';
   return Utilities.formatDate(new Date(), tz, 'MMMM d, yyyy');
+}
+
+// ---------------------------------------------------------------------------
+// Workday-aware date helpers
+//
+// All standups operate on a Mon-Fri cycle. Submissions made on Friday land
+// in Monday's digest, not Saturday's. These helpers centralize that rule
+// so the rest of the codebase doesn't have to think about weekends.
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns YYYY-MM-DD for the next workday (Mon-Fri), in the configured TZ.
+ * If today is Mon-Thu, returns tomorrow. If Fri/Sat/Sun, returns next Monday.
+ */
+function getNextWorkdayDate() {
+  var tz = getSetting('TIMEZONE') || 'Asia/Kathmandu';
+  var d = new Date();
+  do {
+    d.setDate(d.getDate() + 1);
+  } while (d.getDay() === 0 || d.getDay() === 6);
+  return Utilities.formatDate(d, tz, 'yyyy-MM-dd');
+}
+
+/**
+ * Returns "Monday, January 13, 2026" style label for the next workday.
+ * Used as the date shown on the standup form card so Friday cards say
+ * "Monday" instead of "Saturday".
+ */
+function getNextWorkdayLabel() {
+  var tz = getSetting('TIMEZONE') || 'Asia/Kathmandu';
+  var d = new Date();
+  do {
+    d.setDate(d.getDate() + 1);
+  } while (d.getDay() === 0 || d.getDay() === 6);
+  return Utilities.formatDate(d, tz, 'EEEE, MMMM d, yyyy');
+}
+
+/**
+ * Picks which standup date is "active" right now. Used by `/status` and
+ * `/standup` to default to a sensible meeting date when none is given.
+ *
+ *   weekend                       → next Monday's meeting
+ *   weekday before DIGEST_TIME    → today's meeting (still happening this morning)
+ *   weekday at/after DIGEST_TIME  → next workday's meeting (today's meeting is over)
+ *
+ * The DIGEST_TIME cutoff is read from settings on every call so admins
+ * can change it via `/set-schedule` without redeploying. The transition
+ * happens at the moment the digest goes public — before that, "today's
+ * meeting" is still the active one; after that, attention shifts to
+ * tomorrow's meeting.
+ */
+function getActiveStandupDate() {
+  var now = new Date();
+  var day = now.getDay();
+
+  if (day === 0 || day === 6) {
+    return getNextWorkdayDate();
+  }
+
+  var tz = getSetting('TIMEZONE') || 'Asia/Kathmandu';
+  var digestTime = getSetting('DIGEST_TIME') || '09:00';
+  var nowHHmm = Utilities.formatDate(now, tz, 'HH:mm');
+
+  if (nowHHmm < digestTime) {
+    return getTodayDate();
+  }
+  return getNextWorkdayDate();
+}
+
+/**
+ * Format a YYYY-MM-DD date string as "Monday, January 13, 2026" for display.
+ * Lets handlers turn a stored standup date into a human label.
+ */
+function formatStandupDateLabel(dateStr) {
+  var tz = getSetting('TIMEZONE') || 'Asia/Kathmandu';
+  // Parse YYYY-MM-DD as a local date (avoid UTC midnight gotcha).
+  var parts = dateStr.split('-');
+  var d = new Date(parseInt(parts[0], 10), parseInt(parts[1], 10) - 1, parseInt(parts[2], 10));
+  return Utilities.formatDate(d, tz, 'EEEE, MMMM d, yyyy');
 }
 
 // ---------------------------------------------------------------------------
@@ -37,15 +109,32 @@ function getTodayDateLabel() {
 // ---------------------------------------------------------------------------
 
 /**
- * Sends standup form cards via DM to all active team members.
- * Skips weekends.
+ * Sends standup notification cards via DM to all active team members.
+ *
+ * Skips weekends by default — admins generally don't want the bot
+ * spamming people at 4:45 PM on a Saturday. Manual `/notify-all`
+ * invocations pass `skipWeekendCheck = true` to override.
+ *
+ * Optionally skips a single member by email (`excludeEmail`). Used by
+ * `handleNotifyAll` to avoid sending the caller a duplicate notification
+ * — the caller already sees the notification card as the slash command's
+ * response, so they don't need a second copy via API.
+ *
+ * Uses `botMessageCreate` (service-account auth) for the actual send,
+ * so this works from time-based triggers and from manual slash commands
+ * alike — both run as the bot, not as the caller.
+ *
+ * @param {boolean} [skipWeekendCheck=false]
+ * @param {string}  [excludeEmail]  - team_member email to skip
+ * @returns {{ skipped: string|null, sent: number, failed: number, total: number }}
  */
-function sendStandupCards() {
-  // Skip weekends
-  var day = new Date().getDay();
-  if (day === 0 || day === 6) {
-    Logger.log('Skipping standup — weekend');
-    return;
+function sendStandupNotifications(skipWeekendCheck, excludeEmail) {
+  if (!skipWeekendCheck) {
+    var day = new Date().getDay();
+    if (day === 0 || day === 6) {
+      Logger.log('Skipping standup — weekend');
+      return { skipped: 'weekend', sent: 0, failed: 0, total: 0 };
+    }
   }
 
   var members = getActiveTeamMembers();
@@ -53,24 +142,38 @@ function sendStandupCards() {
 
   if (members.length === 0) {
     Logger.log('No active team members found');
-    return;
+    return { skipped: 'no-members', sent: 0, failed: 0, total: 0 };
   }
 
   if (questions.length === 0) {
     Logger.log('No questions configured');
-    return;
+    return { skipped: 'no-questions', sent: 0, failed: 0, total: 0 };
   }
 
-  var dateLabel = getTomorrowDateLabel();
-  var card = buildStandupCard(questions, dateLabel);
+  var dateLabel = getNextWorkdayLabel();
+  var standupDate = getNextWorkdayDate();
+  // The cron and /notify-all both send the small notification card
+  // (not the full form). The full form is opened on demand by each
+  // member via /standup or by clicking the "Fill Standup" button.
+  var card = buildStandupNotificationCard(dateLabel, standupDate);
 
   var successCount = 0;
   var failCount = 0;
 
+  var skippedCaller = false;
   members.forEach(function(member) {
+    if (excludeEmail && member.email === excludeEmail) {
+      skippedCaller = true;
+      return;
+    }
+    if (!member.chat_user_id) {
+      Logger.log('Skipping ' + member.name + ' (' + member.email + '): no chat_user_id captured yet — they need to interact with the bot first');
+      failCount++;
+      return;
+    }
     try {
-      var dmSpace = getOrCreateDmSpace(member.email);
-      Chat.Spaces.Messages.create(card, dmSpace);
+      var dmSpace = getOrCreateDmSpace(member.chat_user_id);
+      botMessageCreate(card, dmSpace);
       successCount++;
     } catch (e) {
       Logger.log('Failed to DM ' + member.email + ': ' + e.message);
@@ -78,7 +181,12 @@ function sendStandupCards() {
     }
   });
 
-  Logger.log('Standup cards sent: ' + successCount + ' success, ' + failCount + ' failed');
+  Logger.log('Standup notifications sent: ' + successCount + ' success, ' + failCount + ' failed'
+    + (skippedCaller ? ' (caller excluded)' : ''));
+  // `total` reflects the number of members the function actually tried
+  // to notify, so callers can build accurate "X of Y" messages.
+  var attempted = members.length - (skippedCaller ? 1 : 0);
+  return { skipped: null, sent: successCount, failed: failCount, total: attempted };
 }
 
 // ---------------------------------------------------------------------------
@@ -100,6 +208,8 @@ function sendStandupCards() {
 function onCardClick(event) {
   Logger.log('onCardClick fallback invoked: ' + JSON.stringify(event));
 
+  captureChatUserId(event);
+
   var common = event.commonEventObject || event.common || {};
   var action = common.invokedFunction;
   var chatEvent = event.chat || event;
@@ -111,6 +221,7 @@ function onCardClick(event) {
 
   switch (action) {
     case 'handleStandupSubmit':          return handleStandupSubmit(event);
+    case 'handleShowStandupForm':        return handleShowStandupForm(event);
     case 'handleShowScheduleDialog':     return handleShowScheduleDialog(event);
     case 'handleSaveSchedule':           return handleSaveSchedule(event);
     case 'handleShowQuestions':          return handleShowQuestions(event);
@@ -139,6 +250,35 @@ function onCardClick(event) {
 function getFormInputs(event) {
   var common = event.commonEventObject || event.common || {};
   return common.formInputs || {};
+}
+
+/**
+ * Captures the calling user's canonical Chat resource name from the
+ * event and persists it to their team_members row. Idempotent and
+ * cached, so it costs at most one Supabase write per user per 6 hours.
+ *
+ * Bot-credentialed Chat API calls require numeric user IDs (not
+ * emails). The numeric ID lives in `event.user.name` on every
+ * incoming event but isn't stored anywhere we can use later — this
+ * helper grabs it the first time a user interacts with the bot and
+ * makes it available for autonomous DM sends going forward.
+ */
+function captureChatUserId(event) {
+  var chatEvent = event.chat || event;
+  var user = chatEvent.user || event.user;
+  if (!user || !user.email || !user.name) return;
+
+  var cache = CacheService.getScriptCache();
+  var cacheKey = 'cuid:' + user.email;
+  if (cache.get(cacheKey) === user.name) return;
+
+  try {
+    updateMemberChatUserId(user.email, user.name);
+    cache.put(cacheKey, user.name, 21600);
+    Logger.log('Captured chat_user_id for ' + user.email + ': ' + user.name);
+  } catch (e) {
+    Logger.log('Failed to capture chat_user_id for ' + user.email + ': ' + e.message);
+  }
 }
 
 /**
@@ -192,6 +332,11 @@ function readStringInput(formInputs, name) {
  * @returns {Object} Response card
  */
 function onMessage(event) {
+  // Capture caller's chat_user_id on every interaction so autonomous
+  // sends (cron prompts, reminders) can find their DM later. No-op if
+  // already captured for this user within the cache window.
+  captureChatUserId(event);
+
   // Add-on format: event data is nested under event.chat
   var chatEvent = event.chat || event;
 
@@ -253,18 +398,57 @@ function createCardResponse(card) {
 }
 
 /**
- * Wraps a card for a button-click response.
- *
- * Slash-command responses are posted as real chat messages via
- * `hostAppDataAction.chatDataAction.createMessageAction`. Buttons on those
- * cards live inside chat messages, so their click responses must also use
- * the `hostAppDataAction` envelope (not `renderActions`, which only
- * applies to add-on home/sidebar cards). Posting a new message is the
- * simplest shape that works in every context — the click produces a new
- * card below the current one, and the user can scroll back.
+ * Wraps a card for a button-click response that should appear as a NEW
+ * message in the conversation. Used by the "show dialog" / "open list"
+ * handlers — they post the dialog or list as a fresh card below the
+ * triggering message, leaving the original (e.g. /settings) intact.
  */
 function createNavResponse(cardResult) {
   return createCardResponse(cardResult);
+}
+
+/**
+ * Wraps a card for a button-click response that should REPLACE the
+ * message containing the clicked button. Used by terminal actions
+ * (Save, Add, Remove, Activate, Purge) so a dialog transforms into its
+ * confirmation in place — no stacked card residue.
+ *
+ * Caveats: only works on messages this bot created, and Google has a
+ * soft age limit on edits (minutes-to-hours). For interactive flows
+ * where the user clicks Save shortly after opening the dialog, this is
+ * never a problem.
+ */
+function createUpdateResponse(cardResult) {
+  return {
+    hostAppDataAction: {
+      chatDataAction: {
+        updateMessageAction: {
+          message: cardResult
+        }
+      }
+    }
+  };
+}
+
+/**
+ * Extracts the Chat space from an event, regardless of which payload
+ * shape Google delivers it in. Returns null if no space is found.
+ */
+function getEventSpace(event) {
+  var chatEvent = event.chat || event;
+  if (chatEvent.appCommandPayload && chatEvent.appCommandPayload.space) {
+    return chatEvent.appCommandPayload.space;
+  }
+  if (chatEvent.messagePayload && chatEvent.messagePayload.space) {
+    return chatEvent.messagePayload.space;
+  }
+  if (event.message && event.message.space) {
+    return event.message.space;
+  }
+  if (event.space) {
+    return event.space;
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -279,6 +463,8 @@ function createNavResponse(cardResult) {
  */
 function handleStandupSubmit(event) {
   Logger.log('handleStandupSubmit invoked');
+
+  captureChatUserId(event);
 
   var chatEvent = event.chat || event;
   var user = chatEvent.user || event.user;
@@ -308,7 +494,7 @@ function handleStandupSubmit(event) {
   }
 
   if (!member) {
-    return createNavResponse(buildTextCard('Error', 'You are not registered as a team member. Contact an admin.'));
+    return createUpdateResponse(buildTextCard('Error', 'You are not registered as a team member. Contact an admin.'));
   }
 
   var answers = {};
@@ -331,14 +517,21 @@ function handleStandupSubmit(event) {
     }
   }
 
-  // ---- Idempotency layer 2: DB upsert keyed on (date, email) ----
+  // ---- Idempotency layer 2: DB upsert keyed on (meetingDate, email) ----
   // Survives cache eviction, cold starts, and accidental double-clicks
-  // hours apart. One row per user per day, no matter what.
-  var today = getTodayDate();
-  upsertStandupResponse(today, member.name, member.email, answers, jiraTickets);
+  // hours apart. One row per user per meeting, no matter what.
+  //
+  // Storage key is the MEETING DATE the form was filled out for. The
+  // form embeds this in its Submit button params (so /standup 2026-04-13
+  // upserts to that date, not "now"). Falls back to next workday if the
+  // param is missing for some reason.
+  var meetingDate = (params.standupDate && /^\d{4}-\d{2}-\d{2}$/.test(params.standupDate))
+    ? params.standupDate
+    : getNextWorkdayDate();
+  upsertStandupResponse(meetingDate, member.name, member.email, answers, jiraTickets);
 
   Logger.log('Standup recorded for ' + member.name);
-  var response = createNavResponse(buildConfirmationCard(member.name));
+  var response = createUpdateResponse(buildConfirmationCard(member.name));
 
   if (eventTime) {
     cache.put(cacheKey, JSON.stringify(response), 600);
@@ -348,19 +541,116 @@ function handleStandupSubmit(event) {
 }
 
 // ---------------------------------------------------------------------------
+// Open the Standup Form (button click + slash command shared backend)
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolves a meeting date string from various sources, applying these
+ * rules in order:
+ *
+ *   1. If `requestedDate` is provided and parses as a valid YYYY-MM-DD
+ *      (or YYYY/MM/DD) AND it's today or in the future → use it.
+ *   2. If `requestedDate` is provided but invalid or in the past →
+ *      throw, with a message the caller can show to the user.
+ *   3. Otherwise → fall back to `getActiveStandupDate()`.
+ *
+ * @param {string} [requestedDate]
+ * @returns {string} YYYY-MM-DD
+ */
+function resolveStandupDate(requestedDate) {
+  if (!requestedDate) {
+    return getActiveStandupDate();
+  }
+
+  var match = String(requestedDate).match(/^(\d{4})[\/-](\d{2})[\/-](\d{2})$/);
+  if (!match) {
+    throw new Error('Invalid date "' + requestedDate + '". Use YYYY-MM-DD or YYYY/MM/DD.');
+  }
+  var normalized = match[1] + '-' + match[2] + '-' + match[3];
+
+  // Verify the date is real (e.g. reject 2026-02-31).
+  var parsed = new Date(parseInt(match[1], 10), parseInt(match[2], 10) - 1, parseInt(match[3], 10));
+  if (parsed.getFullYear() !== parseInt(match[1], 10)
+      || parsed.getMonth() !== parseInt(match[2], 10) - 1
+      || parsed.getDate() !== parseInt(match[3], 10)) {
+    throw new Error('Invalid date "' + requestedDate + '" — not a real calendar date.');
+  }
+
+  // Reject past dates. "Today" is allowed because backfill for the
+  // morning's meeting is sometimes legitimate (e.g. you got pulled into
+  // a meeting before you could fill it).
+  if (normalized < getTodayDate()) {
+    throw new Error('Cannot fill a standup for a past date (' + normalized + '). Only today and future dates are allowed.');
+  }
+
+  return normalized;
+}
+
+/**
+ * Button-click handler for the "Fill Standup" button on the daily
+ * notification card. Returns the full standup form, replacing the
+ * notification card in place.
+ *
+ * If the caller already submitted a response for this meeting date,
+ * the form is pre-filled with their saved answers — same form, edit
+ * mode. Otherwise it's blank.
+ */
+function handleShowStandupForm(event) {
+  Logger.log('handleShowStandupForm invoked');
+
+  captureChatUserId(event);
+
+  var chatEvent = event.chat || event;
+  var user = chatEvent.user || event.user;
+  var callerEmail = (user && user.email) || null;
+
+  var params = getParams(event);
+  var requestedDate = params.standupDate || null;
+
+  var standupDate;
+  try {
+    standupDate = resolveStandupDate(requestedDate);
+  } catch (e) {
+    return createUpdateResponse(buildTextCard('Invalid Date', e.message));
+  }
+
+  var questions = getQuestions();
+  if (questions.length === 0) {
+    return createUpdateResponse(buildTextCard('No Questions', 'No standup questions are configured. Ask an admin to add some via /add-question.'));
+  }
+
+  var existingAnswers = null;
+  if (callerEmail) {
+    var existing = getStandupResponse(standupDate, callerEmail);
+    if (existing && existing.answers) {
+      existingAnswers = existing.answers;
+    }
+  }
+
+  var dateLabel = formatStandupDateLabel(standupDate);
+  return createUpdateResponse(buildStandupCard(questions, dateLabel, standupDate, existingAnswers));
+}
+
+// ---------------------------------------------------------------------------
 // Send Reminders (triggered at REMINDER_TIME)
 // ---------------------------------------------------------------------------
 
 /**
- * Sends reminder DMs to team members who haven't submitted today.
+ * Sends reminder DMs to team members who haven't submitted for the
+ * upcoming meeting (the next workday's standup).
+ *
+ * Reminders fire at REMINDER_TIME on the same day submissions opened
+ * (e.g. 17:15 right after the 16:45 prompt). Submissions are stored
+ * keyed by the meeting date (next workday), so we need to query that
+ * date — not today — to find non-responders.
  */
 function sendReminders() {
   var day = new Date().getDay();
   if (day === 0 || day === 6) return;
 
-  var today = getTodayDate();
+  var meetingDate = getNextWorkdayDate();
   var members = getActiveTeamMembers();
-  var respondedEmails = getRespondedEmails(today);
+  var respondedEmails = getRespondedEmails(meetingDate);
 
   var nonResponders = members.filter(function(m) {
     return respondedEmails.indexOf(m.email) === -1;
@@ -375,9 +665,13 @@ function sendReminders() {
   var sentCount = 0;
 
   nonResponders.forEach(function(member) {
+    if (!member.chat_user_id) {
+      Logger.log('Skipping reminder for ' + member.name + ' (' + member.email + '): no chat_user_id captured yet');
+      return;
+    }
     try {
-      var dmSpace = getOrCreateDmSpace(member.email);
-      Chat.Spaces.Messages.create(reminderCard, dmSpace);
+      var dmSpace = getOrCreateDmSpace(member.chat_user_id);
+      botMessageCreate(reminderCard, dmSpace);
       sentCount++;
     } catch (e) {
       Logger.log('Failed to remind ' + member.email + ': ' + e.message);
@@ -392,14 +686,37 @@ function sendReminders() {
 // ---------------------------------------------------------------------------
 
 /**
- * Posts the daily standup digest to the team space.
+ * Posts the standup digest for a meeting date to the team space.
+ *
+ * Two invocation modes:
+ *
+ *   postDigest()
+ *     Cron mode. No date passed → uses today's date and skips weekends.
+ *     This is what the time-based trigger calls at DIGEST_TIME.
+ *
+ *   postDigest('2026-04-13')
+ *     Manual mode. Skips the weekend check (admin is explicitly asking),
+ *     uses the given meeting date for the query and the card label.
+ *     Used by the `/digest-now [YYYY-MM-DD]` slash command and for
+ *     ad-hoc testing from the editor.
+ *
+ * Submissions are stored keyed by MEETING DATE, so the query is always
+ * `date = meetingDate` regardless of which day this function runs on.
+ *
+ * @param {string} [meetingDate] - YYYY-MM-DD; defaults to getTodayDate()
+ * @returns {{ ok: boolean, reason: string|null, responseCount: number }}
  */
-function postDigest() {
-  var day = new Date().getDay();
-  if (day === 0 || day === 6) return;
+function postDigest(meetingDate) {
+  if (!meetingDate) {
+    var day = new Date().getDay();
+    if (day === 0 || day === 6) {
+      Logger.log('postDigest skipping — weekend');
+      return { ok: false, reason: 'weekend', responseCount: 0 };
+    }
+    meetingDate = getTodayDate();
+  }
 
-  var today = getTodayDate();
-  var responses = getTodaysResponses(today);
+  var responses = getTodaysResponses(meetingDate);
   var questions = getQuestions();
   var members = getActiveTeamMembers();
   var settings = getAllSettings();
@@ -407,24 +724,59 @@ function postDigest() {
   var spaceId = settings['STANDUP_SPACE_ID'];
   if (!spaceId || spaceId === 'spaces/REPLACE_ME') {
     Logger.log('STANDUP_SPACE_ID not configured');
-    return;
+    return { ok: false, reason: 'no-space', responseCount: 0 };
   }
 
-  // Find non-responders
   var respondedEmails = responses.map(function(r) { return r.email; });
   var nonResponders = members
     .filter(function(m) { return respondedEmails.indexOf(m.email) === -1; })
     .map(function(m) { return m.name; });
 
-  var dateLabel = getTodayDateLabel();
-  var digestCard = buildDigestCard(responses, questions, nonResponders, dateLabel);
+  var dateLabel = formatStandupDateLabel(meetingDate);
 
+  // Step 1: post the SUMMARY card to the team space. The response
+  // includes a `thread.name` reference we use for the per-person replies.
+  var summaryCard = buildDigestSummaryCard(responses, nonResponders, dateLabel);
+  var summaryMessage;
   try {
-    Chat.Spaces.Messages.create(digestCard, spaceId);
-    Logger.log('Digest posted to ' + spaceId);
+    summaryMessage = botMessageCreate(summaryCard, spaceId);
   } catch (e) {
-    Logger.log('Failed to post digest: ' + e.message);
+    Logger.log('Failed to post digest summary: ' + e.message);
+    return { ok: false, reason: e.message, responseCount: responses.length };
   }
+
+  Logger.log('Digest summary posted to ' + spaceId + ' for ' + meetingDate);
+
+  // Step 2: post each member's response as a reply in the summary thread.
+  // We don't fail the whole digest if a single reply fails — log and
+  // keep going. Worst case the channel still has the summary, just
+  // missing one or two thread replies.
+  var threadName = summaryMessage && summaryMessage.thread && summaryMessage.thread.name;
+  var repliesPosted = 0;
+  var repliesFailed = 0;
+
+  if (threadName) {
+    responses.forEach(function(response) {
+      try {
+        var replyCard = buildDigestReplyCard(response, questions);
+        botMessageCreateInThread(replyCard, spaceId, threadName);
+        repliesPosted++;
+      } catch (e) {
+        Logger.log('Failed to post digest reply for ' + response.email + ': ' + e.message);
+        repliesFailed++;
+      }
+    });
+  } else {
+    Logger.log('No thread name on summary message — skipping per-person replies');
+  }
+
+  Logger.log('Digest complete for ' + meetingDate + ': '
+    + responses.length + ' responses, '
+    + nonResponders.length + ' non-responders, '
+    + repliesPosted + ' replies posted'
+    + (repliesFailed ? ', ' + repliesFailed + ' replies failed' : ''));
+
+  return { ok: true, reason: null, responseCount: responses.length };
 }
 
 // ---------------------------------------------------------------------------
@@ -432,21 +784,27 @@ function postDigest() {
 // ---------------------------------------------------------------------------
 
 /**
- * Gets or creates a DM space with a user.
+ * Gets or creates a DM space between the bot and a user.
+ *
+ * Uses bot-credentialed REST calls (Bot.gs) so the lookup runs as the
+ * bot itself, not as the calling user. This sidesteps the "DM with
+ * yourself" rejection that occurs when the script runs as a human user
+ * and tries to find a DM with that same user.
+ *
+ * Tries `findDirectMessage` first; falls back to `setupDm` if no DM
+ * exists yet.
+ *
  * @param {string} email - User's email
  * @returns {string} Space name (e.g. "spaces/AAAA")
  */
 function getOrCreateDmSpace(email) {
-  var response = Chat.Spaces.setup({
-    spaceType: 'DIRECT_MESSAGE',
-    members: [{
-      member: {
-        name: 'users/' + email,
-        type: 'HUMAN'
-      }
-    }]
-  });
-  return response.name;
+  var existing = botFindDirectMessage(email);
+  if (existing && existing.name) {
+    return existing.name;
+  }
+
+  var created = botSetupDm(email);
+  return created.name;
 }
 
 // ---------------------------------------------------------------------------
@@ -458,15 +816,24 @@ function getOrCreateDmSpace(email) {
  */
 function notifyAdminsJiraExpired() {
   var admins = getAdmins();
+  var members = getAllTeamMembers();
+  var memberByEmail = {};
+  members.forEach(function(m) { memberByEmail[m.email] = m; });
+
   var warningCard = buildTextCard(
     'Jira Token Expired',
     'The Jira API token has expired or is invalid. Standup collection continues but Jira tickets are unavailable.\n\nUpdate the token in Apps Script → Project Settings → Script Properties → JIRA_API_TOKEN.'
   );
 
   admins.forEach(function(admin) {
+    var member = memberByEmail[admin.email];
+    if (!member || !member.chat_user_id) {
+      Logger.log('Cannot notify admin ' + admin.email + ': no chat_user_id captured (admin must also be a team_member who has interacted with the bot)');
+      return;
+    }
     try {
-      var dmSpace = getOrCreateDmSpace(admin.email);
-      Chat.Spaces.Messages.create(warningCard, dmSpace);
+      var dmSpace = getOrCreateDmSpace(member.chat_user_id);
+      botMessageCreate(warningCard, dmSpace);
     } catch (e) {
       Logger.log('Failed to notify admin ' + admin.email + ': ' + e.message);
     }
@@ -488,9 +855,9 @@ function createTriggers() {
   var settings = getAllSettings();
   var promptTime = settings['PROMPT_TIME'] || '16:45';
   var reminderTime = settings['REMINDER_TIME'] || '17:15';
-  var digestTime = settings['DIGEST_TIME'] || '17:30';
+  var digestTime = settings['DIGEST_TIME'] || '09:00';
 
-  createDailyTrigger('sendStandupCards', promptTime);
+  createDailyTrigger('sendStandupNotifications', promptTime);
   createDailyTrigger('sendReminders', reminderTime);
   createDailyTrigger('postDigest', digestTime);
 
@@ -530,7 +897,7 @@ function createDailyTrigger(functionName, timeStr) {
  */
 function deleteTriggers() {
   var owned = {
-    sendStandupCards: true,
+    sendStandupNotifications: true,
     sendReminders: true,
     postDigest: true,
     checkDbUsage: true
@@ -597,10 +964,19 @@ function checkDbUsage() {
       + 'Use the <b>/purge</b> command to delete old standup data and free up space.'
     );
 
+    var allMembers = getAllTeamMembers();
+    var byEmail = {};
+    allMembers.forEach(function(m) { byEmail[m.email] = m; });
+
     admins.forEach(function(admin) {
+      var member = byEmail[admin.email];
+      if (!member || !member.chat_user_id) {
+        Logger.log('Cannot notify admin ' + admin.email + ': no chat_user_id');
+        return;
+      }
       try {
-        var dmSpace = getOrCreateDmSpace(admin.email);
-        Chat.Spaces.Messages.create(warningCard, dmSpace);
+        var dmSpace = getOrCreateDmSpace(member.chat_user_id);
+        botMessageCreate(warningCard, dmSpace);
       } catch (e) {
         Logger.log('Failed to notify admin ' + admin.email + ': ' + e.message);
       }
