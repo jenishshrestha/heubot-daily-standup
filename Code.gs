@@ -334,13 +334,63 @@ function readStringInput(formInputs, name) {
 }
 
 // ---------------------------------------------------------------------------
-// Message Handler (Slash Commands)
+// Workspace Add-on event handlers
+//
+// After publishing to Google Workspace Marketplace, Chat uses the
+// newer add-on event model which dispatches to different function
+// names than the old Chat app model:
+//
+//   onAppCommand       — slash commands (was: onMessage with slashCommand)
+//   onMessage          — regular text messages (unchanged)
+//   onCardClick        — button clicks (unchanged)
+//   onAddedToSpace     — bot added to a space (new)
+//   onRemovedFromSpace — bot removed from a space (new)
+//
+// The three new handlers delegate to existing code paths. onMessage
+// still handles both the conversational-standup flow and (defensively)
+// any slash commands that happen to arrive via the old path.
 // ---------------------------------------------------------------------------
 
 /**
- * Google Chat event handler for messages (slash commands).
+ * Fired when the user invokes a slash command. In the new add-on
+ * model this replaces onMessage's slashCommand branch.
+ */
+function onAppCommand(event) {
+  return onMessage(event);
+}
+
+/**
+ * Fired when the bot is added to a space (DM or group). Used as an
+ * implicit onboarding hook — capture the caller's chat_user_id so
+ * future autonomous DMs can find them.
+ */
+function onAddedToSpace(event) {
+  Logger.log('onAddedToSpace invoked');
+  try {
+    captureChatUserId(event);
+  } catch (e) {
+    Logger.log('onAddedToSpace capture failed: ' + e.message);
+  }
+  return createTextResponse("Hi! I'm Heubot. Run /standup to fill in your daily standup.");
+}
+
+/**
+ * Fired when the bot is removed from a space. Nothing to clean up —
+ * team_members rows persist in Supabase (admins can deactivate via
+ * /team if needed).
+ */
+function onRemovedFromSpace(event) {
+  Logger.log('onRemovedFromSpace invoked');
+}
+
+/**
+ * Google Chat event handler for messages.
+ * - In the new add-on model: handles regular text messages only
+ *   (slash commands come through onAppCommand).
+ * - In the old Chat app model: handles both regular messages and
+ *   slash commands. Kept defensive so both paths work.
  * @param {Object} event - Google Chat event
- * @returns {Object} Response card
+ * @returns {Object} Response card or text
  */
 function onMessage(event) {
   // Capture caller's chat_user_id on every interaction so autonomous
