@@ -129,6 +129,17 @@ function formatStandupDateLabel(dateStr) {
  * @returns {{ skipped: string|null, sent: number, failed: number, total: number }}
  */
 function sendStandupNotifications(skipWeekendCheck, excludeEmail) {
+  // Time-based triggers pass an event object as the first arg. Coerce
+  // anything that isn't a real boolean to false so the cron behaves like
+  // a real cron (respects the weekend skip). Manual /notify-all callers
+  // explicitly pass `true`.
+  if (skipWeekendCheck !== true) {
+    skipWeekendCheck = false;
+  }
+  if (typeof excludeEmail !== 'string') {
+    excludeEmail = null;
+  }
+
   if (!skipWeekendCheck) {
     var day = new Date().getDay();
     if (day === 0 || day === 6) {
@@ -361,6 +372,19 @@ function onMessage(event) {
     return routeSlashCommand(event);
   }
 
+  // Check for an active conversational standup session (DMs only).
+  // If the user is in the middle of answering questions, route their
+  // text message to the session handler instead of the default response.
+  var space = getEventSpace(event);
+  var isDm = space && (space.singleUserBotDm || space.type === 'DIRECT_MESSAGE' || space.type === 'DM');
+
+  if (isDm && user && user.email) {
+    var session = getStandupSession(user.email);
+    if (session) {
+      return handleStandupAnswer(event, session);
+    }
+  }
+
   // Default response for non-command messages
   return createTextResponse("Hi! I'm Heubot, your standup assistant. Use slash commands to interact with me.");
 }
@@ -587,13 +611,57 @@ function resolveStandupDate(requestedDate) {
 }
 
 /**
- * Button-click handler for the "Fill Standup" button on the daily
- * notification card. Returns the full standup form, replacing the
- * notification card in place.
+ * Shared logic for starting a conversational standup session. Used by
+ * both `/standup` (slash command) and the "Fill Standup" button on
+ * the notification card.
  *
- * If the caller already submitted a response for this meeting date,
- * the form is pre-filled with their saved answers — same form, edit
- * mode. Otherwise it's blank.
+ * Returns { introText } on success, or { error } if something's wrong.
+ *
+ * @param {string} email          - Caller's email
+ * @param {string} [requestedDate] - Optional explicit date (YYYY-MM-DD)
+ * @returns {{ introText: string } | { error: string }}
+ */
+function beginStandupConversation(email, requestedDate) {
+  var standupDate;
+  try {
+    standupDate = resolveStandupDate(requestedDate);
+  } catch (e) {
+    return { error: e.message };
+  }
+
+  var questions = getQuestions();
+  if (questions.length === 0) {
+    return { error: 'No standup questions are configured. Ask an admin to add some via /add-question.' };
+  }
+
+  var members = getActiveTeamMembers();
+  var member = null;
+  for (var i = 0; i < members.length; i++) {
+    if (members[i].email === email) {
+      member = members[i];
+      break;
+    }
+  }
+  if (!member) {
+    return { error: 'You are not registered as a team member. Contact an admin.' };
+  }
+
+  var existingAnswers = null;
+  var existing = getStandupResponse(standupDate, email);
+  if (existing && existing.answers) {
+    existingAnswers = existing.answers;
+  }
+
+  var session = startStandupSession(email, standupDate, questions, member.name, existingAnswers);
+  return { introText: buildSessionIntro(session) };
+}
+
+/**
+ * Button-click handler for the "Fill Standup" button on the daily
+ * notification card. Starts a conversational session (same as /standup)
+ * and replaces the notification card with the intro message + Q1.
+ *
+ * The card form is still available as a fallback via /standup --form.
  */
 function handleShowStandupForm(event) {
   Logger.log('handleShowStandupForm invoked');
@@ -607,28 +675,275 @@ function handleShowStandupForm(event) {
   var params = getParams(event);
   var requestedDate = params.standupDate || null;
 
-  var standupDate;
+  var result = beginStandupConversation(callerEmail, requestedDate);
+
+  if (result.error) {
+    return createUpdateResponse(buildTextCard('Error', result.error));
+  }
+
+  // Replace the notification card with the session intro text.
+  // The conversation continues as plain text messages from here.
+  return {
+    hostAppDataAction: {
+      chatDataAction: {
+        updateMessageAction: {
+          message: { text: result.introText }
+        }
+      }
+    }
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Conversational Standup Session (state machine)
+//
+// Instead of a card form, the bot asks questions one at a time via
+// plain text messages. The user types their answer as a regular chat
+// message. This gives a natural "talking to a colleague" feel and
+// uses the full Chat input box instead of cramped card widgets.
+//
+// Session state is kept in CacheService (6-hour TTL). Each user can
+// have at most one active session at a time.
+//
+// The card form remains available as a fallback — the "Fill Standup"
+// button on the notification card opens the card form via
+// handleShowStandupForm.
+// ---------------------------------------------------------------------------
+
+var SESSION_TTL = 21600; // 6 hours
+
+function getSessionCacheKey(email) {
+  return 'standup_session:' + email;
+}
+
+/**
+ * Creates a new conversational standup session for a user and returns
+ * the intro message + first question.
+ */
+function startStandupSession(email, standupDate, questions, memberName, existingAnswers) {
+  var session = {
+    email: email,
+    standupDate: standupDate,
+    questions: questions.map(function(q) {
+      return { id: String(q.id), question: q.question, required: !!q.required };
+    }),
+    currentIndex: 0,
+    answers: {},
+    existingAnswers: existingAnswers || {},
+    memberName: memberName,
+    isEditing: !!(existingAnswers && Object.keys(existingAnswers).length > 0)
+  };
+
+  CacheService.getScriptCache().put(
+    getSessionCacheKey(email),
+    JSON.stringify(session),
+    SESSION_TTL
+  );
+
+  return session;
+}
+
+function getStandupSession(email) {
+  var raw = CacheService.getScriptCache().get(getSessionCacheKey(email));
+  if (!raw) return null;
   try {
-    standupDate = resolveStandupDate(requestedDate);
+    return JSON.parse(raw);
   } catch (e) {
-    return createUpdateResponse(buildTextCard('Invalid Date', e.message));
+    return null;
+  }
+}
+
+function saveStandupSession(session) {
+  CacheService.getScriptCache().put(
+    getSessionCacheKey(session.email),
+    JSON.stringify(session),
+    SESSION_TTL
+  );
+}
+
+function clearStandupSession(email) {
+  CacheService.getScriptCache().remove(getSessionCacheKey(email));
+}
+
+/**
+ * Formats the current question as a text prompt.
+ */
+function buildQuestionPrompt(session) {
+  var q = session.questions[session.currentIndex];
+  var total = session.questions.length;
+  var num = session.currentIndex + 1;
+  var inputKey = 'question_' + q.id;
+
+  var text = '*(' + num + '/' + total + ') ' + q.question + '*';
+
+  // Show previous answer in edit mode
+  if (session.isEditing && session.existingAnswers[inputKey]) {
+    text += '\n_Previous: ' + session.existingAnswers[inputKey] + '_';
   }
 
-  var questions = getQuestions();
-  if (questions.length === 0) {
-    return createUpdateResponse(buildTextCard('No Questions', 'No standup questions are configured. Ask an admin to add some via /add-question.'));
+  // Hint for optional questions
+  if (!q.required) {
+    text += '\n_(Optional)_';
   }
 
-  var existingAnswers = null;
-  if (callerEmail) {
-    var existing = getStandupResponse(standupDate, callerEmail);
-    if (existing && existing.answers) {
-      existingAnswers = existing.answers;
+  return text;
+}
+
+/**
+ * Builds the intro message shown when a session starts, including
+ * the first question.
+ */
+function buildSessionIntro(session) {
+  var dateLabel = formatStandupDateLabel(session.standupDate);
+  var total = session.questions.length;
+  var intro;
+
+  if (session.isEditing) {
+    intro = '*Editing your standup for ' + dateLabel + '*\n'
+      + total + ' question' + (total === 1 ? '' : 's')
+      + '. Type a new answer or "keep" to keep your previous one.\n\n'
+      + '_Commands: "keep" · "skip" (optional) · "back" · "cancel"_';
+  } else {
+    intro = '*Standup for ' + dateLabel + '*\n'
+      + total + ' question' + (total === 1 ? '' : 's')
+      + '. Just type your answer and send.\n\n'
+      + '_Commands: "skip" (optional) · "back" · "cancel"_';
+  }
+
+  intro += '\n\n' + buildQuestionPrompt(session);
+  return intro;
+}
+
+/**
+ * Processes a user's text message as an answer in their active
+ * conversational standup session. Handles commands (skip, back,
+ * cancel, keep) and regular answers.
+ *
+ * @param {Object} event - Google Chat event
+ * @param {Object} session - The active session from cache
+ * @returns {Object} Text response with the next question, or confirmation
+ */
+function handleStandupAnswer(event, session) {
+  var chatEvent = event.chat || event;
+  var message = null;
+  if (chatEvent.messagePayload && chatEvent.messagePayload.message) {
+    message = chatEvent.messagePayload.message;
+  } else if (chatEvent.appCommandPayload && chatEvent.appCommandPayload.message) {
+    message = chatEvent.appCommandPayload.message;
+  } else {
+    message = event.message;
+  }
+
+  var text = ((message && message.text) || '').trim();
+  var lower = text.toLowerCase();
+
+  // ---- Command: cancel ----
+  if (lower === 'cancel' || lower === 'quit' || lower === 'exit') {
+    clearStandupSession(session.email);
+    return createTextResponse('Standup cancelled. Run /standup to start again.');
+  }
+
+  // ---- Command: back ----
+  if (lower === 'back' || lower === 'undo') {
+    if (session.currentIndex === 0) {
+      return createTextResponse('Already at the first question.\n\n' + buildQuestionPrompt(session));
+    }
+    session.currentIndex--;
+    saveStandupSession(session);
+    return createTextResponse(buildQuestionPrompt(session));
+  }
+
+  var q = session.questions[session.currentIndex];
+  var inputKey = 'question_' + q.id;
+
+  // ---- Command: skip (optional questions only) ----
+  if (lower === 'skip') {
+    if (q.required) {
+      return createTextResponse('This question is required and cannot be skipped.\n\n' + buildQuestionPrompt(session));
+    }
+    session.answers[inputKey] = '';
+    session.currentIndex++;
+    saveStandupSession(session);
+
+    if (session.currentIndex >= session.questions.length) {
+      return completeStandupSession(session);
+    }
+    return createTextResponse(buildQuestionPrompt(session));
+  }
+
+  // ---- Command: keep (edit mode — retain previous answer) ----
+  if (lower === 'keep') {
+    if (!session.isEditing || !session.existingAnswers[inputKey]) {
+      return createTextResponse('No previous answer to keep for this question. Type your answer instead.\n\n' + buildQuestionPrompt(session));
+    }
+    session.answers[inputKey] = session.existingAnswers[inputKey];
+    session.currentIndex++;
+    saveStandupSession(session);
+
+    if (session.currentIndex >= session.questions.length) {
+      return completeStandupSession(session);
+    }
+    return createTextResponse(buildQuestionPrompt(session));
+  }
+
+  // ---- Blank answer ----
+  if (!text) {
+    if (q.required) {
+      return createTextResponse('This question is required. Please type your answer.\n\n' + buildQuestionPrompt(session));
+    }
+    // Optional + blank → treat as skip
+    session.answers[inputKey] = '';
+    session.currentIndex++;
+    saveStandupSession(session);
+
+    if (session.currentIndex >= session.questions.length) {
+      return completeStandupSession(session);
+    }
+    return createTextResponse(buildQuestionPrompt(session));
+  }
+
+  // ---- Regular answer ----
+  session.answers[inputKey] = text;
+  session.currentIndex++;
+  saveStandupSession(session);
+
+  if (session.currentIndex >= session.questions.length) {
+    return completeStandupSession(session);
+  }
+  return createTextResponse(buildQuestionPrompt(session));
+}
+
+/**
+ * Saves all collected answers to the database, fetches Jira tickets,
+ * clears the session, and returns a confirmation message.
+ */
+function completeStandupSession(session) {
+  var jiraTickets = [];
+  try {
+    jiraTickets = fetchJiraTickets(session.email);
+  } catch (e) {
+    Logger.log('Jira fetch failed during session complete for ' + session.email + ': ' + e.message);
+    if (e.message && e.message.indexOf('401') > -1) {
+      notifyAdminsJiraExpired();
     }
   }
 
-  var dateLabel = formatStandupDateLabel(standupDate);
-  return createUpdateResponse(buildStandupCard(questions, dateLabel, standupDate, existingAnswers));
+  upsertStandupResponse(
+    session.standupDate,
+    session.memberName,
+    session.email,
+    session.answers,
+    jiraTickets
+  );
+
+  clearStandupSession(session.email);
+  Logger.log('Conversational standup completed for ' + session.memberName + ' (' + session.standupDate + ')');
+
+  var dateLabel = formatStandupDateLabel(session.standupDate);
+  return createTextResponse(
+    'Thanks, ' + session.memberName + '! Your standup for *' + dateLabel + '* has been recorded.\n\n'
+    + '_You can edit your answers by running /standup again before the morning digest._'
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -707,6 +1022,14 @@ function sendReminders() {
  * @returns {{ ok: boolean, reason: string|null, responseCount: number }}
  */
 function postDigest(meetingDate) {
+  // Time-based triggers call this as `postDigest(triggerEvent)`, so the
+  // first argument is an event object — not a date. Treat anything that
+  // isn't a string as "no date provided" and fall back to cron behavior
+  // (use today's date, skip weekends).
+  if (typeof meetingDate !== 'string') {
+    meetingDate = null;
+  }
+
   if (!meetingDate) {
     var day = new Date().getDay();
     if (day === 0 || day === 6) {
@@ -898,6 +1221,7 @@ function createDailyTrigger(functionName, timeStr) {
 function deleteTriggers() {
   var owned = {
     sendStandupNotifications: true,
+    sendStandupCards: true,         // legacy name — clean up if found
     sendReminders: true,
     postDigest: true,
     checkDbUsage: true

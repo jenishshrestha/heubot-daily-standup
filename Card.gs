@@ -370,7 +370,13 @@ function buildDigestReplyCard(response, questions) {
       decoratedText: {
         topLabel: 'Jira Tickets',
         text: response.jira_tickets.map(function(t) {
-          return getStatusEmoji(t.status) + ' <b>' + t.key + '</b> ' + t.summary + ' [' + t.status + ']';
+          // Wrap the key in <a href> so it opens the ticket in Jira
+          // when clicked. Fall back to plain bold if the row is from
+          // an older submission that didn't capture the URL.
+          var keyHtml = t.url
+            ? '<a href="' + t.url + '"><b>' + t.key + '</b></a>'
+            : '<b>' + t.key + '</b>';
+          return getStatusEmoji(t.status) + ' ' + keyHtml + ' ' + t.summary + ' [' + t.status + ']';
         }).join('\n'),
         wrapText: true
       }
