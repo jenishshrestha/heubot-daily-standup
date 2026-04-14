@@ -1,21 +1,253 @@
 # Heubot — Google Chat Standup Bot
 
-A Google Chat add-on that runs async daily standups for a Google Workspace team. Members get a private DM each afternoon prompting them to fill in their standup; the next morning a digest is posted to a shared team space.
+Async daily standup bot for the Heubert Nepal team. Members fill a 3-question standup from their Chat DM each afternoon; a consolidated digest posts to the team space the next morning.
 
-Modeled on DailyBot/Geekbot, built free on Apps Script + Supabase.
+Modeled on DailyBot/Geekbot, built on Apps Script + Supabase.
+
+**Status:** Live in production since April 14, 2026.
 
 ---
 
-## What it does
+## Table of Contents
 
-- **16:45 every workday** → bot DMs each active team member a small notification card with a "Fill Standup" button
-- **Members fill the form** in their own DM (privately) — answers, optional Jira tickets pulled in automatically
-- **17:15** → bot DMs a reminder to anyone who hasn't submitted yet
-- **09:00 next workday** → bot posts a digest to the shared team space
-  - Main message: a small summary card (response counts, names of responders and non-responders)
-  - Each individual response is a thread reply under the summary
-- **Friday submissions land in Monday's digest** (skips weekends)
-- **Responses are editable** until the digest goes out (re-open the form, modify, re-submit)
+1. [For admins — what you need to know](#for-admins--what-you-need-to-know)
+2. [Onboarding new team members](#onboarding-new-team-members)
+3. [Common admin tasks](#common-admin-tasks)
+4. [When things go wrong](#when-things-go-wrong)
+5. [Current production state](#current-production-state)
+6. [Architecture](#architecture)
+7. [For developers — setup from scratch](#for-developers--setup-from-scratch)
+8. [Database schema](#database-schema)
+9. [File-by-file overview](#file-by-file-overview)
+10. [Maintenance & credential rotation](#maintenance--credential-rotation)
+11. [Troubleshooting (dev-level)](#troubleshooting-dev-level)
+12. [Known limitations](#known-limitations)
+
+---
+
+## For admins — what you need to know
+
+**Admins currently:** `jenish@heubert.com`, `sameer@heubert.com`, `nikhil@heubert.com`
+
+Admins can run privileged slash commands that affect everyone's standup flow. Non-admins can only use `/standup` (to fill their own standup).
+
+### The daily cycle (automatic)
+
+| Time (Asia/Kathmandu) | What happens | Function |
+|---|---|---|
+| **16:45** | Bot DMs every active member a notification card | `sendStandupNotifications` |
+| **17:15** | Bot DMs anyone who hasn't submitted yet | `sendReminders` |
+| **09:00 next workday** | Bot posts consolidated digest to the **Heubot Standups** team space | `postDigest` |
+| 1st of month, ~10:00 | Bot checks DB usage and warns admins if near quota | `checkDbUsage` |
+
+Weekends are skipped automatically. Friday notifications are for Monday's meeting.
+
+### Slash commands — admin-only
+
+All of these are DM-only (run them in your 1-on-1 DM with Heubot):
+
+| Command | What it does |
+|---|---|
+| `/settings` | Shows current bot configuration (schedule, team size, questions, digest space) |
+| `/set-schedule` | Opens a form to change prompt / reminder / digest times |
+| `/questions` | List current standup questions with Remove buttons |
+| `/add-question` | Add a new question to the standup form |
+| `/team` | List active and inactive team members with Remove / Activate buttons |
+| `/add-member` | Add a new team member |
+| `/notify-all` | Manually trigger the daily prompt (if the 16:45 cron didn't fire or you want to re-send) |
+| `/digest-now [YYYY-MM-DD]` | Manually post the daily digest (defaults to today's meeting) |
+| `/status` | Shows who's submitted and who's still pending for the upcoming standup |
+| `/purge` | Delete standup responses by date range (for data retention) |
+| `/set-this-space` | Run inside a team space to register it as the digest destination |
+
+### Slash commands — everyone (admins and members)
+
+| Command | What it does |
+|---|---|
+| `/standup` | Opens a conversational standup session for the active meeting date |
+| `/standup YYYY-MM-DD` | Opens the form for a specific future meeting date (useful for pre-filling) |
+
+---
+
+## Onboarding new team members
+
+When someone joins the team and needs to start receiving standup prompts, do these 3 things in order:
+
+### 1. Add them to the `team_members` database
+
+Run `/add-member` in your DM with Heubot. Fill in:
+
+- **Name** — as you want it to appear in the digest
+- **Email** — their Heubert Google Workspace email
+- **Jira Username** — leave blank (optional; email is used for ticket lookup as a fallback)
+
+Alternatively, run this SQL in Supabase directly:
+
+```sql
+INSERT INTO team_members (name, email, jira_username, active)
+VALUES ('Full Name', 'email@heubert.com', '', true);
+```
+
+### 2. Send them the onboarding message
+
+Paste this in a DM or email to the new member:
+
+> Hey [name] — I've added you to Heubot, our daily standup bot.
+>
+> **One-time setup (~30 seconds):**
+> 1. Open Google Chat → **Apps** in the sidebar → search **Heubot** → click **Install**
+> 2. Accept the permissions it asks for
+> 3. Run **`/standup`** once in the DM that opens
+>
+> That's it. From tomorrow you'll get a prompt at 4:45 PM each workday to fill in your standup. The next morning, everyone's updates get posted to the **Heubot Standups** space for our morning sync.
+>
+> Ping me if you hit any issues.
+
+### 3. Verify they're set up
+
+Once they've run `/standup` once, check in Supabase:
+
+```sql
+SELECT name, email, chat_user_id, active
+FROM team_members
+WHERE email = 'their.email@heubert.com';
+```
+
+If `chat_user_id` is populated (starts with `users/` followed by numbers), they're fully onboarded. They'll receive their first notification at 16:45 the next workday.
+
+**If `chat_user_id` is `NULL`**, they haven't interacted with the bot yet. They need to run `/standup` (or any slash command) once.
+
+### Important — why the one-time interaction is required
+
+Google Chat API requires a numeric user ID (like `users/117260094786438825675`) to send autonomous DMs. Apps Script can't look up that ID from an email — the bot has to capture it from an event the user triggers. So every new member must run at least one slash command before the bot can DM them automatically.
+
+---
+
+## Common admin tasks
+
+### Remove someone who left the company
+
+**Soft delete (preserves their historical standup data):**
+
+```sql
+UPDATE team_members SET active = false WHERE email = 'leaver@heubert.com';
+```
+
+Or run `/team` and click the **Remove** button next to their name. They stop receiving prompts but their past responses stay in digests.
+
+**Hard delete (GDPR / "forget this person"):**
+
+```sql
+DELETE FROM standup_responses WHERE email = 'leaver@heubert.com';
+DELETE FROM team_members WHERE email = 'leaver@heubert.com';
+```
+
+### Promote someone to admin
+
+```sql
+INSERT INTO admins (email) VALUES ('new.admin@heubert.com');
+```
+
+They can immediately run admin slash commands. No other setup needed.
+
+### Change the daily schedule
+
+Run `/set-schedule` in your DM. Enter new times in 24-hour format (HH:MM). Click Save.
+
+The bot also rebuilds the time-based triggers on save, so the new schedule takes effect starting the next day.
+
+**Note:** Apps Script time triggers fire in a 1-hour window, not at the exact minute. "16:45" means "somewhere between 16:00 and 17:00."
+
+### Change the standup questions
+
+- `/questions` — shows current questions with Remove buttons
+- `/add-question` — opens a form to add a new one
+
+Changes apply to the next standup cycle. Members who already submitted for the current meeting keep their previous answers.
+
+### Change the digest space
+
+If you create a new team space and want digests to post there instead:
+
+1. Add Heubot to the new space (`@Heubot` → Add to space)
+2. Run `/set-this-space` from inside the new space
+3. Verify with `/settings` — should show the new space ID
+
+### Manually trigger the daily prompt (if cron failed)
+
+Run `/notify-all` in your DM. The bot sends notification cards to every active member. Skip the weekend check — runs regardless of day.
+
+### Manually post the digest (if cron failed)
+
+Run `/digest-now` in your DM. Posts the digest for **today's meeting**. For a specific date:
+
+```
+/digest-now 2026-04-15
+```
+
+### Check who's submitted
+
+Run `/status` in your DM. Shows the active meeting date, count of responders and pending members, and names in each bucket.
+
+### Delete old standup data
+
+Run `/purge` in your DM. Enter a start and end date. Deletes all responses in that range across all members. Can't be undone — double-check the dates before clicking Delete.
+
+---
+
+## When things go wrong
+
+### "Bot isn't DMing [person]"
+
+Their `chat_user_id` hasn't been captured. Have them run `/standup` once. If they can't find Heubot in Chat, re-send them the onboarding instructions (above).
+
+### "No digest posted this morning"
+
+The cron may have failed. Run `/digest-now` manually. Then check **Apps Script → Executions** for the 09:00 entry:
+
+- If no entry exists, the trigger may have been disabled. Contact the developer to re-install triggers.
+- If the entry failed, the error message will tell you what's wrong.
+
+### "`/set-schedule` gave a trigger rebuild warning"
+
+Normal — Google's trigger-creation quota resets on a rolling 24-hour window. The settings save succeeded; only the trigger rebuild failed. The old trigger times stay in effect. Contact the developer to run `createTriggers` manually from the Apps Script editor when the quota resets.
+
+### "Standup Space is `spaces/REPLACE_ME`"
+
+The digest space was never registered. Go to the Heubot Standups space and run `/set-this-space`.
+
+### "Jira tickets aren't showing up in the digest"
+
+Likely the Jira API token expired. Admins receive a DM notification when this happens. Contact the developer to update the `JIRA_API_TOKEN` in Apps Script Script Properties.
+
+### "Bot says 'Access Denied' when I run an admin command"
+
+Your email isn't in the `admins` table. Ask an existing admin to add you (SQL above), or verify you're signed in as your heubert.com account (not a personal Google account).
+
+### "Empty/useless digest Monday morning after a Friday holiday"
+
+Known edge case. The digest fires on Monday showing "0 of 14 responded" because nobody filled Friday. Just ignore it and proceed with the day. Future versions may suppress empty digests.
+
+---
+
+## Current production state
+
+As of April 14, 2026:
+
+| | Value |
+|---|---|
+| **GCP project** | `heubot` |
+| **Apps Script script ID** | `14qUQXBvMSYxoNeqg1ixfk0hepIFm1ljzhSiLoDDLzrt2d1gebkq3qllM` |
+| **Service account** | `heubot-bot@heubot.iam.gserviceaccount.com` |
+| **Active deployment type** | Add-on (Workspace Add-on model) |
+| **Marketplace status** | Published privately to Heubert Workspace |
+| **Timezone** | Asia/Kathmandu |
+| **Schedule** | Prompt 16:45 · Reminder 17:15 · Digest 09:00 next workday |
+| **Digest space** | `spaces/AAQAYxN4n3A` (Heubot Standups) |
+| **Team size** | 14 active members |
+| **Admins** | jenish@heubert.com, sameer@heubert.com, nikhil@heubert.com |
+| **Backing store** | Supabase (Asia/Kathmandu region) |
+| **Jira** | Heubert Atlassian, Basic Auth with API token |
 
 ---
 
@@ -55,26 +287,16 @@ flowchart LR
 
 **Two distinct paths into the Chat API:**
 
-- **Solid lines** — request/response for inbound events. The bot receives a slash command or button click, runs a handler, and returns a card. Google Chat posts the response *as the bot* automatically because the framework owns the identity for these calls.
-- **Dotted lines** — autonomous outbound sends (cron prompts, reminders, digests). These can't use the framework's identity because there's no event to attach to. Instead `Bot.gs` mints an OAuth token from a GCP service account and calls `chat.googleapis.com` directly. Without this path, time-triggered cron jobs would fail with `"Message cannot have cards for requests carrying human credentials"`.
+- **Solid lines** — request/response for inbound user events. Handler returns a card; framework posts it as the bot.
+- **Dotted lines** — autonomous outbound sends (cron prompts, reminders, digests). `Bot.gs` mints OAuth tokens from a GCP service account and calls `chat.googleapis.com` directly. Without this, cron jobs would fail with `"Message cannot have cards for requests carrying human credentials"`.
 
 ---
 
-## Tech stack
+## For developers — setup from scratch
 
-| Layer | Choice | Why |
-|---|---|---|
-| Runtime | Apps Script V8 | Free, hosted, integrates natively with Workspace |
-| Backend | Supabase (PostgREST) | Free tier, no server to run, SQL access |
-| Bot identity | GCP service account + JWT bearer flow | Required to send card-bearing messages autonomously |
-| Local dev | `clasp` + `bun` | Edit locally in VS Code, push to Apps Script with one command |
-| Source control | Git + GitHub | Standard |
+This section is for recreating Heubot from nothing in a new Workspace or migrating to a new Google account.
 
----
-
-## Prerequisites
-
-Before starting setup, you need:
+### Prerequisites
 
 - A **Google Workspace** account (admin access to enable the Chat API)
 - A **Google Cloud Console** account in the same org
@@ -82,184 +304,150 @@ Before starting setup, you need:
 - A **Jira Cloud** account (optional, only if you want Jira ticket integration)
 - **Node.js** or **Bun** installed locally
 - **`clasp`** (Apps Script CLI, installed via npm/bun)
-- A code editor (VS Code recommended)
-
----
-
-## Setup
+- A code editor
 
 ### Step 1 — Create the Google Cloud project
 
-1. Go to [console.cloud.google.com](https://console.cloud.google.com)
-2. Top-left project picker → **New Project**
-3. Name it something memorable (e.g. `heubot`)
-4. Make sure it's under your **Workspace organization**, not "No organization"
-5. Click **Create**
+1. [console.cloud.google.com](https://console.cloud.google.com) → top-left project picker → **New Project**
+2. Name it `heubot` (or similar)
+3. Ensure it's under your **Workspace organization**, not "No organization"
+4. **Create**
 
 ### Step 2 — Enable required APIs
 
-In your new GCP project:
-
-1. **APIs & Services → Library**
-2. Search for and enable each of:
-   - **Google Chat API**
-   - **Google Apps Script API**
+In your new GCP project, **APIs & Services → Library**, enable:
+- **Google Chat API**
+- **Google Apps Script API**
+- **Google Workspace Marketplace SDK** (needed later for private publishing)
 
 ### Step 3 — Configure the OAuth consent screen
 
-1. **APIs & Services → OAuth consent screen**
-2. **User type: Internal** (only people in your Workspace can authorize the bot)
-3. Fill in:
-   - App name: `Heubot`
-   - User support email: your email
-   - Developer contact: your email
-4. **Save and continue** through the rest (no scopes or test users needed)
+**APIs & Services → OAuth consent screen** → **User type: Internal** → fill in app name `Heubot`, support email, developer email → Save.
 
-### Step 4 — Set up Supabase database
+### Step 4 — Set up Supabase
 
-1. Go to [supabase.com](https://supabase.com) → New Project
-2. Pick a name, database password, region
-3. Wait for provisioning (~2 min)
-4. Once ready, go to **SQL Editor** and run the schema from the [Database schema](#database-schema) section below
-5. Go to **Project Settings → API** and copy:
-   - **Project URL** (looks like `https://xxxxx.supabase.co`)
-   - **`service_role` key** (NOT the `anon` key — we need elevated access for the bot)
+1. [supabase.com](https://supabase.com) → New Project → pick name, password, region
+2. Wait for provisioning (~2 min)
+3. **SQL Editor** → run the schema in [Database schema](#database-schema)
+4. **Project Settings → API** → copy:
+   - **Project URL**
+   - **`service_role` key** (not anon key)
 
 ### Step 5 — Create Jira API token (optional)
 
-Skip this section if you don't want Jira integration.
-
-1. Visit [id.atlassian.com/manage-profile/security/api-tokens](https://id.atlassian.com/manage-profile/security/api-tokens)
-2. **Create API token** → name it `heubot`
-3. Copy the token (you only see it once)
-4. Note your Jira email and your Jira domain (e.g. `yourcompany.atlassian.net`)
+1. [id.atlassian.com/manage-profile/security/api-tokens](https://id.atlassian.com/manage-profile/security/api-tokens) → Create token → name it `heubot` → copy
+2. Note your Jira email and domain (e.g. `yourcompany.atlassian.net`)
 
 ### Step 6 — Create the Apps Script project
 
-1. Go to [script.google.com](https://script.google.com)
-2. **New project**
-3. Rename it from "Untitled project" to `Heubot`
-4. **Project Settings (gear icon, left sidebar)**:
-   - Check **"Show 'appsscript.json' manifest file in editor"**
-   - Note the **Script ID** at the top — you'll need it for clasp
-5. Note the **Cloud Platform (GCP) Project number** field — click **Change project** and link it to the GCP project from Step 1
+1. [script.google.com](https://script.google.com) → New project → rename to `Heubot`
+2. **Project Settings → Show `appsscript.json` manifest** → enabled
+3. Link the Cloud Platform project from Step 1 (same page)
 
 ### Step 7 — Create the service account (bot identity)
 
-The service account is the bot's own identity. Without it, the bot can only respond to direct interactions; it can't autonomously DM users or post to spaces (Google rejects card-bearing messages from human-credentialed callers).
+Required for autonomous card-bearing messages. Without this, cron jobs and any non-user-triggered action fail.
 
-1. GCP Console → **IAM & Admin → Service Accounts**
-2. **+ Create Service Account**
-3. Name: `heubot-bot`, ID auto-fills
-4. Description: `Bot identity for Heubot Chat add-on`
-5. **Create and Continue**
-6. **Skip** the role assignment step (the bot identity is granted via the Chat API project membership, not via IAM roles)
-7. **Done**
-8. Click on the new `heubot-bot` service account → **Keys** tab → **Add Key → Create new key → JSON**
-9. **A JSON file downloads** — save it somewhere safe (password manager, secure cloud storage). You'll paste its contents into Apps Script in the next step. **Never commit this file to git.**
+1. GCP Console → **IAM & Admin → Service Accounts → Create**
+2. Name: `heubot-bot`
+3. Skip the role assignment step
+4. **Done**
+5. Click the new service account → **Keys → Add Key → Create new key → JSON** → file downloads
+6. **Save the JSON somewhere safe** (password manager). Never commit it to git.
 
-### Step 8 — Add Script Properties (credentials storage)
+### Step 8 — Populate Script Properties
 
-In Apps Script editor → **Project Settings (gear icon) → Script Properties → + Add script property**.
-
-Add each of these:
+Apps Script editor → **Project Settings → Script Properties → + Add script property**. Add:
 
 | Property | Value |
 |---|---|
-| `SUPABASE_URL` | `https://xxxxx.supabase.co` from Step 4 |
-| `SUPABASE_KEY` | `service_role` key from Step 4 |
-| `SERVICE_ACCOUNT_KEY` | Entire JSON contents of the file from Step 7 (paste as one big block) |
-| `JIRA_EMAIL` | Your Jira account email (only if using Jira integration) |
-| `JIRA_API_TOKEN` | The Jira API token from Step 5 (only if using Jira integration) |
+| `SUPABASE_URL` | Supabase project URL |
+| `SUPABASE_KEY` | `service_role` key |
+| `SERVICE_ACCOUNT_KEY` | Full JSON contents of the service account key file |
+| `JIRA_EMAIL` | Jira email (if using Jira) |
+| `JIRA_API_TOKEN` | Jira API token (if using Jira) |
 
-### Step 9 — Set up local development with clasp + bun
+### Step 9 — Set up local development
 
-This lets you edit code locally in VS Code instead of the web IDE.
+```bash
+bun install              # installs clasp from package.json
+bunx clasp login         # browser OAuth
+```
 
-1. **Install bun** (if you don't have it): `curl -fsSL https://bun.sh/install | bash`
-2. **Clone this repo** (or copy the files into a local folder)
-3. In the project folder: `bun install` (installs `@google/clasp` locally)
-4. **Enable the Apps Script API for your account**: visit [script.google.com/home/usersettings](https://script.google.com/home/usersettings) → toggle **Google Apps Script API** to **On**
-5. **Login**: `bunx clasp login` → opens a browser, sign in with the same Google account as the Apps Script project
-6. **Create `.clasp.json`** in the project root with your script ID:
-   ```json
-   {"scriptId":"YOUR_SCRIPT_ID_HERE","rootDir":"."}
-   ```
-   This file is gitignored — never commit it.
-7. **Verify connection**: `bun run status` — should list the `.gs` files that would be pushed
-8. **First push**: `bun run push` — uploads all source files to Apps Script
+Enable the Apps Script API for your account: [script.google.com/home/usersettings](https://script.google.com/home/usersettings) → toggle **On**.
 
-The day-to-day workflow from here is: edit `.gs` files in VS Code → `bun run push` → test in Chat → `git commit`.
+Create `.clasp.json` in the project root:
+```json
+{"scriptId":"YOUR_SCRIPT_ID_HERE","rootDir":"."}
+```
 
-### Step 10 — Configure the Chat API
+This file is gitignored — don't commit it.
+
+```bash
+bun run status           # verify link works
+bun run push             # first push uploads all source files
+```
+
+Day-to-day loop: edit `.gs` files in VS Code → `bun run push` → test in Chat → `git commit`.
+
+### Step 10 — Create the initial deployment
+
+1. Apps Script → **Deploy → New deployment** → gear icon → **Add-on**
+2. Description: `Initial deploy`
+3. **Deploy** → copy the **Deployment ID**
+
+### Step 11 — Configure the Chat API
 
 1. GCP Console → **APIs & Services → Google Chat API → Configuration**
 2. Fill in:
    - **App name**: `Heubot`
-   - **Avatar URL**: paste a URL to a logo image (you can use the [logo.png](logo.png) in this repo)
-   - **Description**: `Daily standup bot`
-   - **Functionality**: check both **Receive 1:1 messages** and **Join spaces and group conversations**
-   - **Connection settings**: pick **Apps Script project** and paste your **Deployment ID** (you'll create one in Step 11 — you can come back to fill this in later)
-   - **Visibility**: **Make this Chat app available to specific people and groups in [your domain]** for testing, or **all people in [your domain]** for full rollout
-3. **Don't save yet** — slash commands are added in the same page (Step 12)
-
-### Step 11 — Create an Apps Script deployment
-
-1. Apps Script editor → top-right **Deploy → New deployment**
-2. Click the **gear icon** → pick **Add-on** (or **Chat app**)
-3. **Description**: `Initial deploy`
-4. **Deploy**
-5. Copy the **Deployment ID** that appears
-6. Go back to **GCP Console → Chat API → Configuration → Connection settings** and paste the deployment ID
+   - **Avatar URL**: public URL to logo image
+   - **Description**: short description
+   - **Functionality**: check **Receive 1:1 messages** and **Join spaces and group conversations**
+   - **Connection settings**: select **Apps Script project** → paste the Deployment ID
+   - **App availability**: choose initial visibility (start with just your email)
 
 ### Step 12 — Register slash commands
 
-Still in **Chat API → Configuration**, scroll to **Slash commands** and add each of the following with **"Opens a dialog" UNCHECKED** for all of them:
+Still in Chat API → Configuration → Slash commands → **Add a slash command**, register each (all with **"Opens a dialog" UNCHECKED**):
 
-| Command ID | Name | Description | Available in |
-|---|---|---|---|
-| `1` | `/settings` | Show current bot configuration | Both |
-| `2` | `/set-schedule` | Update prompt/reminder/digest times | Both |
-| `3` | `/questions` | Show standup questions | Both |
-| `4` | `/add-question` | Add a new question | Both |
-| `5` | `/team` | Show team members | Both |
-| `6` | `/add-member` | Add a team member | Both |
-| `7` | `/notify-all` | Notify all members to fill standup | Both |
-| `8` | `/status` | Show today's standup status | Both |
-| `9` | `/purge` | Delete responses by date range | Both |
-| `10` | `/set-this-space` | Use this space for the daily digest | Both |
-| `11` | `/standup` | Fill in your standup | Both |
-| `12` | `/digest-now` | Manually post the digest | Both |
+| Command ID | Name | Description |
+|---|---|---|
+| 1 | `/settings` | Show current bot configuration |
+| 2 | `/set-schedule` | Update prompt/reminder/digest times |
+| 3 | `/questions` | Show standup questions |
+| 4 | `/add-question` | Add a new question |
+| 5 | `/team` | Show team members |
+| 6 | `/add-member` | Add a team member |
+| 7 | `/notify-all` | Notify all members to fill standup |
+| 8 | `/status` | Show today's standup status |
+| 9 | `/purge` | Delete responses by date range |
+| 10 | `/set-this-space` | Use this space for the daily digest |
+| 11 | `/standup` | Fill your daily standup |
+| 12 | `/digest-now` | Manually post the digest |
 
-The **Command ID must match exactly** — they're hardcoded into the slash command router in [Admin.gs](Admin.gs).
+**Command IDs must match exactly** — they're hardcoded in `Admin.gs`. Click Save at the bottom of the entire Configuration page (critical — the per-command popup save alone isn't enough).
 
-**After adding all commands, click Save at the bottom of the entire Configuration page.** This is the #1 gotcha — the per-command popup has its own Save, but you also need to save the outer page or none of it persists.
+### Step 13 — Test authorization
 
-### Step 13 — Authorize the script and grant scopes
+In Apps Script editor → function dropdown → **`testBotAuth`** → **Run**. Accept all permissions on first run. Check Executions — should print:
 
-1. Apps Script editor → open [Bot.gs](Bot.gs) → in the function dropdown pick `testBotAuth` → **Run**
-2. The first run prompts for authorization. Accept all the requested scopes (Chat, external_request, scriptapp, etc.)
-3. Check the **Executions** log — should print:
-   ```
-   Bot token minted (length: 1024)
-   Found existing DM with users/<your-id>: spaces/<...>
-   --- testBotAuth passed ---
-   ```
-4. If it fails, see [Troubleshooting](#troubleshooting)
+```
+Bot token minted (length: 1024)
+Found existing DM with users/<id>: spaces/<...>
+--- testBotAuth passed ---
+```
 
 ### Step 14 — Seed the database
 
-In Supabase SQL Editor, run:
+Supabase SQL Editor:
 
 ```sql
--- Add yourself as the first admin
-INSERT INTO admins (email) VALUES ('your.email@yourcompany.com');
+INSERT INTO admins (email) VALUES ('your.email@heubert.com');
 
--- Add yourself as a team member
 INSERT INTO team_members (name, email, jira_username, active)
-VALUES ('Your Name', 'your.email@yourcompany.com', '', true);
+VALUES ('Your Name', 'your.email@heubert.com', '', true);
 
--- Default schedule (admins can change via /set-schedule)
 INSERT INTO settings (key, value) VALUES
   ('PROMPT_TIME', '16:45'),
   ('REMINDER_TIME', '17:15'),
@@ -269,69 +457,48 @@ INSERT INTO settings (key, value) VALUES
   ('JIRA_DOMAIN', 'yourcompany.atlassian.net'),
   ('JIRA_PROJECT', 'PROJ');
 
--- Default standup questions
 INSERT INTO questions (sort_order, question, required) VALUES
   (1, 'What did you accomplish today?', true),
   (2, 'What will you work on tomorrow?', true),
   (3, 'Any blockers?', false);
 ```
 
-Adjust the values to match your team.
+### Step 15 — Install the test deployment
 
-### Step 15 — Install the test deployment in Chat
+Apps Script → **Deploy → Test deployments → Install**. Open Chat → Apps → find Heubot → start a DM → run `/settings` to confirm everything works.
 
-1. Apps Script editor → **Deploy → Test deployments** → **Install** (or Done if already installed)
-2. Open Google Chat in a browser
-3. Sidebar → **Apps** → search for "Heubot" → click → start a DM with the bot
-4. Run `/settings` — you should see your settings card
+### Step 16 — Set up the team digest space
 
-### Step 16 — Set up the team space for digests
+1. Google Chat → create a space named `Heubot Standups`
+2. Type: **Collaboration**, Access: **Private**
+3. Add Heubot via `@Heubot → Add to space`
+4. Run `/set-this-space` from inside the space
 
-1. In Google Chat, click **+** next to "Spaces" → **Create space**
-2. Name: `Standups` (or whatever fits)
-3. Type: **Collaboration** (not Announcements — bots can't post to Announcements without manager privileges)
-4. Access: **Private**
-5. **Create**
-6. In the new space, type `@Heubot` → **Add to space**
-7. Run `/set-this-space` from inside the space → registers it as the digest destination
+### Step 17 — Install triggers
 
-### Step 17 — Install time-based triggers
+Apps Script editor → function dropdown → **`createTriggers`** → Run. Verify the Triggers tab shows 4 triggers (`sendStandupNotifications`, `sendReminders`, `postDigest`, `checkDbUsage`).
 
-The bot needs cron triggers to run autonomously each day.
+### Step 18 — Publish privately to Workspace Marketplace
 
-1. Apps Script editor → in the function dropdown pick `createTriggers` → **Run**
-2. Authorize if prompted
-3. Check **Triggers** (clock icon, left sidebar) — should show 4 triggers:
-   - `sendStandupNotifications` daily at PROMPT_TIME (16:45)
-   - `sendReminders` daily at REMINDER_TIME (17:15)
-   - `postDigest` daily at DIGEST_TIME (09:00)
-   - `checkDbUsage` monthly on day 1
+For making the bot available to the whole org without maintaining a visibility list:
 
-If you get a "too many triggers" error, your service account has hit the rolling daily creation budget. Wait ~24 hours and try again.
-
-### Step 18 — Onboard team members
-
-For each person on your team:
-
-1. Admin runs `/add-member` (or directly INSERTs into `team_members`)
-2. The new member opens Heubot in their Chat sidebar (via Apps panel) and runs **any** slash command — e.g. `/standup`
-3. That single interaction captures their `chat_user_id` to the database, which is required for the bot to autonomously DM them
-
-After their first interaction, they'll start receiving the daily 16:45 notification automatically.
+1. GCP Console → **Google Workspace Marketplace SDK** (enable if needed)
+2. **App Configuration** — set deployment, OAuth scopes (copy from `appsscript.json`), Chat integration
+3. **Store Listing** — fill in app name, logo (128×128), banner (220×140), screenshots (1280×800), description, privacy policy URL, support URL
+4. **Publish** → choose **Private** (My Domain) → instant publish, no review
+5. (Optional) Workspace admin can push-install via admin.google.com for the whole org
 
 ---
 
 ## Database schema
 
 ```sql
--- Settings (key/value)
 CREATE TABLE settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL,
   updated_at TIMESTAMPTZ DEFAULT now()
 );
 
--- Team members
 CREATE TABLE team_members (
   id BIGSERIAL PRIMARY KEY,
   name TEXT NOT NULL,
@@ -342,7 +509,6 @@ CREATE TABLE team_members (
   created_at TIMESTAMPTZ DEFAULT now()
 );
 
--- Standup questions
 CREATE TABLE questions (
   id BIGSERIAL PRIMARY KEY,
   sort_order INTEGER NOT NULL,
@@ -351,7 +517,6 @@ CREATE TABLE questions (
   created_at TIMESTAMPTZ DEFAULT now()
 );
 
--- Standup responses
 CREATE TABLE standup_responses (
   id BIGSERIAL PRIMARY KEY,
   date DATE NOT NULL,
@@ -363,13 +528,11 @@ CREATE TABLE standup_responses (
   UNIQUE (date, email)
 );
 
--- Admin emails
 CREATE TABLE admins (
   email TEXT PRIMARY KEY,
   created_at TIMESTAMPTZ DEFAULT now()
 );
 
--- Indexes
 CREATE INDEX idx_responses_date ON standup_responses (date);
 CREATE INDEX idx_responses_email ON standup_responses (email);
 ```
@@ -380,123 +543,109 @@ CREATE INDEX idx_responses_email ON standup_responses (email);
 
 | File | Purpose |
 |---|---|
-| [appsscript.json](appsscript.json) | Apps Script manifest — runtime, OAuth scopes, advanced services |
-| [Code.gs](Code.gs) | Entry points (`onMessage`, `onCardClick`), date helpers, `sendStandupNotifications`, `sendReminders`, `postDigest`, `handleStandupSubmit`, `handleShowStandupForm`, trigger management |
-| [Admin.gs](Admin.gs) | Slash command router and admin handlers (`/settings`, `/team`, `/notify-all`, `/digest-now`, `/standup`, etc.) |
-| [Card.gs](Card.gs) | Cards v2 builders (`buildStandupCard`, `buildStandupNotificationCard`, `buildDigestSummaryCard`, `buildDigestReplyCard`, admin cards) |
-| [Bot.gs](Bot.gs) | Service-account JWT bearer flow + Chat REST wrappers (`getBotAccessToken`, `botMessageCreate`, `botFindDirectMessage`, `botSetupDm`) |
+| [appsscript.json](appsscript.json) | Manifest — OAuth scopes, advanced services, V8 runtime |
+| [Code.gs](Code.gs) | Entry points (`onAppCommand`, `onMessage`, `onCardClick`, `onAddedToSpace`, `onRemovedFromSpace`), date helpers, session state machine, workflow functions (`sendStandupNotifications`, `sendReminders`, `postDigest`, `handleStandupSubmit`, `handleShowStandupForm`), trigger management |
+| [Admin.gs](Admin.gs) | Slash command router and admin handlers |
+| [Card.gs](Card.gs) | Cards v2 builders (`buildStandupCard`, `buildStandupNotificationCard`, `buildDigestSummaryCard`, `buildDigestReplyCard`, all admin cards) |
+| [Bot.gs](Bot.gs) | Service-account JWT bearer auth + Chat REST wrappers (`getBotAccessToken`, `botMessageCreate`, `botFindDirectMessage`, `botSetupDm`, `botMessageCreateInThread`) |
 | [Database.gs](Database.gs) | Supabase REST helpers with retry-with-backoff |
 | [Jira.gs](Jira.gs) | Jira REST v3 ticket fetch via Basic Auth |
 
 ---
 
-## Operating the bot
+## Maintenance & credential rotation
 
-### Daily flow (autonomous)
+### Deploying code changes
 
-| Time | Trigger | Function | Effect |
-|---|---|---|---|
-| 16:45 | Daily | `sendStandupNotifications` | DMs each active member a notification card |
-| 17:15 | Daily | `sendReminders` | DMs members who haven't submitted yet |
-| 09:00 next workday | Daily | `postDigest` | Posts threaded digest to the team space |
-| Day 1 each month | Monthly | `checkDbUsage` | DMs admins if Supabase row count nears free-tier cap |
+Every code change needs **two** pushes for Marketplace users to see it:
 
-### Slash commands
+1. `bun run push` — uploads to Apps Script HEAD
+2. Apps Script editor → **Deploy → Manage deployments** → click pencil on the Add-on deployment → change Version to **New version** → **Deploy**
 
-**For all members:**
-- `/standup` — open the standup form for the next workday meeting
-- `/standup 2026-04-15` — open the form for a specific future date
-
-**For admins only:**
-- `/settings` — show current configuration
-- `/set-schedule` — change prompt/reminder/digest times
-- `/questions` — list and manage questions
-- `/add-question` — add a question
-- `/team` — list and manage team members
-- `/add-member` — add a member
-- `/notify-all` — manually fire the daily prompt
-- `/digest-now [YYYY-MM-DD]` — manually post the digest
-- `/set-this-space` — register the current space as the digest destination
-- `/status` — show who's responded for the active meeting
-- `/purge` — delete responses by date range
-
----
-
-## Maintenance
-
-### Updating credentials
-
-If you need to rotate the Supabase or Jira keys, update the corresponding Script Property in Apps Script. No redeploy needed — the bot reads from `PropertiesService` on every call.
+Step 2 is easy to forget. If you pushed code but users don't see the change, this is almost certainly why.
 
 ### Rotating the service account key
 
-If the service account JSON key is compromised or you need to regenerate it:
-
 1. GCP Console → **IAM & Admin → Service Accounts → heubot-bot → Keys**
 2. **Add Key → Create new key → JSON** → save the file
-3. Apps Script → **Project Settings → Script Properties** → update `SERVICE_ACCOUNT_KEY` with the new JSON contents
-4. Back in GCP Console, **delete the old key** from the same Keys tab
-5. Done — no code change, no redeploy. The next call to `getBotAccessToken()` reads the new key from Script Properties (the cache may serve the old token for up to 55 minutes; clear it manually if needed)
+3. Apps Script → **Project Settings → Script Properties** → update `SERVICE_ACCOUNT_KEY` with the new JSON
+4. Delete the old key from the Keys tab
+5. No code change needed. CacheService may serve the old token for up to 55 minutes.
+
+### Rotating Supabase or Jira keys
+
+Same pattern — update the relevant Script Property (`SUPABASE_KEY`, `JIRA_API_TOKEN`). Takes effect immediately.
 
 ### Trigger management
 
-- View all triggers: `dumpAllTriggers` (run from editor)
-- Wipe all triggers: `deleteAllTriggersHard` (run from editor)
-- Reinstall the standard set: `createTriggers` (run from editor; deletes the project's own triggers first by handler name, then recreates them from current settings)
+- `dumpAllTriggers` (editor) — lists every installed trigger
+- `deleteAllTriggersHard` (editor) — wipes all triggers
+- `createTriggers` (editor) — deletes our own triggers + recreates them from current settings
+- Admin saving `/set-schedule` also triggers a rebuild (subject to quota)
 
 ### Adding a new slash command
 
-1. Add the handler function in [Admin.gs](Admin.gs)
-2. Add a `case` in `routeSlashCommand` with the next unused command ID
-3. `bun run push` to upload
-4. Register the command in **GCP Console → Chat API → Configuration → Slash commands** with the matching ID
-5. Hard-refresh Chat (`Cmd+Shift+R`) — the new command appears in the autocomplete
+1. Add the handler in [Admin.gs](Admin.gs)
+2. Add a `case` in `routeSlashCommand`
+3. `bun run push`
+4. Register the command in GCP Console with the matching Command ID
+5. Bump the deployment version (see "Deploying code changes" above)
+6. Hard-refresh Chat
 
 ---
 
-## Troubleshooting
+## Troubleshooting (dev-level)
 
-### "Heubot is unable to process your request" toast on a button click
+### "Script function not found: onAppCommand"
 
-The handler is throwing an exception or returning a malformed response. Check **Apps Script → Executions → most recent failure → expand log** for the actual error.
-
-### Slash command not appearing in Chat autocomplete
-
-- Did you click **Save at the bottom of the entire Chat API Configuration page**? The per-command popup save isn't enough.
-- Hard-refresh Chat (`Cmd+Shift+R`).
-- Wait ~60 seconds — slash command registration isn't instant.
-- Verify the command shows in the Configuration page list with the correct Command ID.
-
-### "Don't specify the calling user as a membership" error
-
-This means the script ran as a human user and tried to DM that same user. The bot must use service-account auth via [Bot.gs](Bot.gs); make sure no `Chat.Spaces.*` calls remain (use `botMessageCreate` / `botFindDirectMessage` / `botSetupDm`).
+Marketplace-published apps use the Workspace Add-on event model which calls `onAppCommand` instead of `onMessage` for slash commands. Make sure `Code.gs` has the `onAppCommand` handler (it does).
 
 ### "Message cannot have cards for requests carrying human credentials"
 
-Same root cause as above. Service-account auth required.
+Service-account auth is required for card-bearing messages. If you're still seeing this, some code path is calling `Chat.Spaces.Messages.create` directly (old Apps Script advanced service) instead of `botMessageCreate`. Grep for `Chat.Spaces` and replace.
 
-### "Service account authentication doesn't support access to user information using email aliases"
+### "Don't specify the calling user as a membership"
 
-You're calling a Chat API method with an email-style user ID like `users/foo@bar.com`. Service-account-authenticated calls require numeric user IDs (e.g. `users/117260094786438825675`). Capture them via `captureChatUserId` and store in `team_members.chat_user_id`.
+Script is running under a user identity and trying to DM that same user. Use `botFindDirectMessage` / `botSetupDm` (service-account path) instead of the Apps Script Chat advanced service.
+
+### "Invalid input syntax for type date: [object Object]"
+
+A time-triggered function (`postDigest`, `sendStandupNotifications`, etc.) received an event object as its first argument. The function must treat any non-string first arg as "no argument provided" — see the `typeof` check at the top of `postDigest` and `sendStandupNotifications`.
+
+### Cron didn't fire at the expected time
+
+Apps Script triggers fire in a **1-hour window**, not at the exact minute. `nearMinute(45)` means "sometime between :00 and :59 in that hour." If you need exact-second timing, use AWS EventBridge or another external scheduler.
 
 ### "This add-on has created too many time-based triggers"
 
-You've hit the rolling daily trigger-creation budget. Each `createTriggers` run spends 4 from the budget; the budget is ~20/day per user per add-on and refills over 24 hours. Wait a day and try again. Don't spam saves to `/set-schedule` — it tries to recreate triggers each time.
+Google's rolling-24h creation quota is ~20-30. Each `/set-schedule` save burns 4 (delete + recreate all 4 triggers). Wait 24h and run `createTriggers` manually from the editor.
 
-### Bot DM'd a member but the member can't see it
+### "Server could not run this add-on" / generic failure toast
 
-Likely the member is in `team_members` but their `chat_user_id` is null (they haven't interacted with the bot yet). The member needs to run any slash command once (e.g. `/standup`) to capture their user ID. After that, future notifications work.
+Usually a response-shape mismatch or a thrown exception in a handler. Open Apps Script → **Executions** → expand the failed entry for the real error message.
 
-### `/digest-now` shows "No Standup Space"
+### After updating code, Marketplace users still see old behavior
 
-`STANDUP_SPACE_ID` is still `spaces/REPLACE_ME`. Run `/set-this-space` from inside the team space you want to use.
+You pushed to HEAD but didn't bump the versioned deployment. Go to Apps Script → Deploy → Manage deployments → edit → New version.
 
-### Service account smoke test (`testBotAuth`) fails with `invalid_grant`
+---
 
-Usually a clock skew issue (>5 minutes drift between your machine and Google's servers) or a malformed private key. Re-download the JSON key, paste fresh into `SERVICE_ACCOUNT_KEY`. If still failing, regenerate the key entirely.
+## Known limitations
+
+Things the bot does NOT do and won't do without a significant change:
+
+- ❌ **Exact-time cron** — Apps Script triggers fire in 1-hour windows. External scheduler (EventBridge, Cloud Scheduler) required for exact timing.
+- ❌ **Hide admin commands from non-admins** — all slash commands are visible to all users in autocomplete. Admin gate runs server-side and non-admins get "Access Denied".
+- ❌ **Holiday calendar awareness** — currently only skips Sat/Sun. On holidays, prompts still fire and digests will be empty "No Response × N".
+- ❌ **Per-user time zones** — everyone runs on `Asia/Kathmandu`. A distributed team would get prompts at weird hours.
+- ❌ **Automatic question rotation** — same questions every day.
+- ❌ **Cross-team standups** — one question set, one schedule, one digest space for the whole bot.
+- ❌ **Integration with Slack / Teams** — Google Chat only.
+- ❌ **AI-generated summaries** — no LLM post-processing.
+- ❌ **Public distribution** — OAuth consent is Internal, visibility is private Marketplace. External users can't use it.
 
 ---
 
 ## License
 
-Internal tool. No license, not for distribution.
+Internal tool for Heubert. Not licensed for distribution.

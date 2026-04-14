@@ -1,22 +1,22 @@
 {
-    "timeZone": "Asia/Kathmandu",
-    "dependencies": {
-        "enabledAdvancedServices": [
-            {
-                "userSymbol": "Chat",
-                "version": "v1",
-                "serviceId": "chat"
-            }
-        ]
-    },
-    "oauthScopes": [
-        "https://www.googleapis.com/auth/chat.spaces.create",
-        "https://www.googleapis.com/auth/chat.spaces.readonly",
-        "https://www.googleapis.com/auth/chat.messages.create",
-        "https://www.googleapis.com/auth/chat.memberships.readonly",
-        "https://www.googleapis.com/auth/script.external_request",
-        "https://www.googleapis.com/auth/script.scriptapp"
-    ],
-    "exceptionLogging": "STACKDRIVER",
-    "runtimeVersion": "V8"
+  "timeZone": "Asia/Kathmandu",
+  "dependencies": {
+    "enabledAdvancedServices": [
+      {
+        "userSymbol": "Chat",
+        "version": "v1",
+        "serviceId": "chat"
+      }
+    ]
+  },
+  "oauthScopes": [
+    "https://www.googleapis.com/auth/chat.spaces.create",
+    "https://www.googleapis.com/auth/chat.spaces.readonly",
+    "https://www.googleapis.com/auth/chat.messages.create",
+    "https://www.googleapis.com/auth/chat.memberships.readonly",
+    "https://www.googleapis.com/auth/script.external_request",
+    "https://www.googleapis.com/auth/script.scriptapp"
+  ],
+  "exceptionLogging": "STACKDRIVER",
+  "runtimeVersion": "V8"
 }
