@@ -38,7 +38,15 @@ function routeSlashCommand(event) {
   // Commands available to every team member (not just admins).
   // /standup (and /help in future) — these run before the admin gate.
   if (commandId === '11') {
-    return createCardResponse(handleStandup(event));
+    var standupResult = handleStandup(event);
+    // handleStandup returns either:
+    //   - createTextResponse(...) for the conversational flow (pre-wrapped)
+    //   - a raw card for --form fallback or error (needs wrapping)
+    // If it has hostAppDataAction, it's pre-wrapped. Otherwise wrap it.
+    if (standupResult && standupResult.hostAppDataAction) {
+      return standupResult;
+    }
+    return createCardResponse(standupResult);
   }
 
   // Everything else is admin-only.
@@ -512,44 +520,47 @@ function handleDigestNow(event) {
  */
 function handleStandup(event) {
   Logger.log('handleStandup invoked');
-
-  // Capture the caller's chat_user_id so future autonomous DMs work.
-  // The slash command path goes through onMessage which already calls
-  // captureChatUserId, but we call it again here defensively in case
-  // future entry points dispatch directly.
   captureChatUserId(event);
 
   var callerEmail = (event.user && event.user.email) || null;
 
-  // Parse the optional date argument from the slash command text.
-  // event.message.text looks like "/standup" or "/standup 2026-04-13".
+  // Parse optional date argument: "/standup 2026-04-13"
   var text = (event.message && event.message.text) || '';
   var argMatch = text.match(/^\/\S+\s+(.+)$/);
   var requestedDate = argMatch ? argMatch[1].trim() : null;
 
-  var standupDate;
-  try {
-    standupDate = resolveStandupDate(requestedDate);
-  } catch (e) {
-    return buildTextCard('Invalid Date', e.message);
+  // Check for explicit --form flag: "/standup --form" or "/standup --form 2026-04-13"
+  // This is the card-form fallback path.
+  var useForm = false;
+  if (requestedDate && requestedDate.indexOf('--form') > -1) {
+    useForm = true;
+    requestedDate = requestedDate.replace('--form', '').trim() || null;
   }
 
-  var questions = getQuestions();
-  if (questions.length === 0) {
-    return buildTextCard('No Questions', 'No standup questions are configured. Ask an admin to add some via <code>/add-question</code>.');
-  }
-
-  // If the caller has already submitted for this meeting, pre-fill the
-  // form so they're editing their existing response instead of starting
-  // a blank one. The submit handler upserts on (date, email) either way.
-  var existingAnswers = null;
-  if (callerEmail) {
+  // Card form fallback (/standup --form)
+  if (useForm) {
+    var standupDate;
+    try {
+      standupDate = resolveStandupDate(requestedDate);
+    } catch (e) {
+      return buildTextCard('Invalid Date', e.message);
+    }
+    var questions = getQuestions();
+    if (questions.length === 0) {
+      return buildTextCard('No Questions', 'No standup questions configured.');
+    }
+    var existingAnswers = null;
     var existing = getStandupResponse(standupDate, callerEmail);
     if (existing && existing.answers) {
       existingAnswers = existing.answers;
     }
+    return buildStandupCard(questions, formatStandupDateLabel(standupDate), standupDate, existingAnswers);
   }
 
-  var dateLabel = formatStandupDateLabel(standupDate);
-  return buildStandupCard(questions, dateLabel, standupDate, existingAnswers);
+  // Default: conversational flow via shared helper.
+  var result = beginStandupConversation(callerEmail, requestedDate);
+  if (result.error) {
+    return buildTextCard('Error', result.error);
+  }
+  return createTextResponse(result.introText);
 }
