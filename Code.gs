@@ -1107,6 +1107,23 @@ function postDigest(meetingDate) {
 
   var dateLabel = formatStandupDateLabel(meetingDate);
 
+  // Jira health check — if the token's expired the digest's ticket lists
+  // will silently be empty, which looks like "nobody has any work". Post
+  // an alert to the space so whoever runs the digest knows to refresh it.
+  var jiraHealth = checkJiraTokenHealth();
+  if (!jiraHealth.ok) {
+    try {
+      var alertText =
+        '⚠️ *Jira is unreachable for this digest.* ' + jiraHealth.message + '.\n' +
+        'Ticket lists below may be empty or stale. Admin: regenerate at ' +
+        'https://id.atlassian.com/manage-profile/security/api-tokens and ' +
+        'update `JIRA_API_TOKEN` in Apps Script → Project Settings → Script Properties.';
+      botMessageCreate({ text: alertText }, spaceId);
+    } catch (alertErr) {
+      Logger.log('Failed to post Jira alert: ' + alertErr.message);
+    }
+  }
+
   // Step 1: post the SUMMARY card to the team space. The response
   // includes a `thread.name` reference we use for the per-person replies.
   var summaryCard = buildDigestSummaryCard(responses, nonResponders, dateLabel);

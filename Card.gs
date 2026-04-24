@@ -354,7 +354,8 @@ function buildDigestReplyCard(response, questions) {
   var widgets = [];
 
   questions.forEach(function(q) {
-    var answer = response.answers['question_' + q.id] || '<i>No response</i>';
+    var raw = response.answers['question_' + q.id];
+    var answer = raw ? formatChatMarkdownToHtml(raw) : '<i>No response</i>';
     widgets.push({
       decoratedText: {
         topLabel: q.question,
@@ -875,4 +876,34 @@ function buildPurgeDialog() {
       }
     }]
   };
+}
+
+/**
+ * Converts the Chat-flavored markdown users type in the rich editor to
+ * the HTML subset that Cards v2 decoratedText supports.
+ *
+ * Handles:
+ *   *bold*         → <b>bold</b>
+ *   _italic_       → <i>italic</i>
+ *   ~strike~       → <s>strike</s>
+ *   `code`         → <code>code</code>
+ *   newlines       → <br>
+ *   literal <, >, & in the user text are escaped first so they render
+ *   as text (not break the card layout).
+ */
+function formatChatMarkdownToHtml(text) {
+  if (!text) return '';
+  var out = String(text);
+
+  out = out.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+  out = out.replace(/`([^`\n]+)`/g, '<code>$1</code>');
+
+  out = out.replace(/(^|[\s(>])\*([^*\n]+?)\*(?=[\s).,!?:;<]|$)/g, '$1<b>$2</b>');
+  out = out.replace(/(^|[\s(>])_([^_\n]+?)_(?=[\s).,!?:;<]|$)/g, '$1<i>$2</i>');
+  out = out.replace(/(^|[\s(>])~([^~\n]+?)~(?=[\s).,!?:;<]|$)/g, '$1<s>$2</s>');
+
+  out = out.replace(/\r\n|\r|\n/g, '<br>');
+
+  return out;
 }
