@@ -10,7 +10,6 @@
  *
  * Required Supabase settings:
  *   JIRA_DOMAIN    — e.g. heubert.atlassian.net
- *   JIRA_PROJECT   — e.g. HEU
  */
 
 /**
@@ -30,24 +29,20 @@ function fetchJiraTickets(email) {
 
   var settings = getAllSettings();
   var domain = settings['JIRA_DOMAIN'];
-  var project = settings['JIRA_PROJECT'];
 
   if (!domain) {
     Logger.log('Missing JIRA_DOMAIN in settings');
     return [];
   }
 
-  var jql = 'assignee = "' + email + '" AND status NOT IN ("Done", "Closed", "Work completed", "Merged to Production") ORDER BY updated DESC';
-  if (project) {
-    jql = 'project = "' + project + '" AND ' + jql;
-  }
+  var auth = Utilities.base64Encode(jiraEmail + ':' + jiraToken);
+
+  var jql = 'assignee = "' + email + '" AND statusCategory != Done ORDER BY updated DESC';
 
   var url = 'https://' + domain + '/rest/api/3/search/jql'
     + '?jql=' + encodeURIComponent(jql)
     + '&fields=key,summary,status'
-    + '&maxResults=10';
-
-  var auth = Utilities.base64Encode(jiraEmail + ':' + jiraToken);
+    + '&maxResults=50';
 
   var response = UrlFetchApp.fetch(url, {
     method: 'GET',
@@ -93,6 +88,42 @@ function getStatusEmoji(status) {
   if (lower === 'to do' || lower === 'open' || lower === 'backlog') return '⚪';
   if (lower === 'done' || lower === 'closed') return '🟢';
   return '⚫';
+}
+
+/**
+ * Verifies the configured Jira credentials still work.
+ * Used by the digest to surface a "token expired" alert in the team space.
+ *
+ * @returns {{ok: true}} when the token authenticates
+ * @returns {{ok: false, code: number, message: string}} when it doesn't
+ */
+function checkJiraTokenHealth() {
+  var props = PropertiesService.getScriptProperties();
+  var jiraEmail = props.getProperty('JIRA_EMAIL');
+  var jiraToken = props.getProperty('JIRA_API_TOKEN');
+
+  if (!jiraEmail || !jiraToken) {
+    return { ok: false, code: 0, message: 'JIRA_EMAIL or JIRA_API_TOKEN not set in Script Properties' };
+  }
+
+  var domain = getAllSettings()['JIRA_DOMAIN'];
+  if (!domain) {
+    return { ok: false, code: 0, message: 'JIRA_DOMAIN not set in Supabase settings' };
+  }
+
+  var auth = Utilities.base64Encode(jiraEmail + ':' + jiraToken);
+  var response = UrlFetchApp.fetch('https://' + domain + '/rest/api/3/myself', {
+    method: 'GET',
+    headers: { 'Authorization': 'Basic ' + auth, 'Accept': 'application/json' },
+    muteHttpExceptions: true
+  });
+
+  var code = response.getResponseCode();
+  if (code === 200) return { ok: true };
+  if (code === 401 || code === 403) {
+    return { ok: false, code: code, message: 'Jira token expired or revoked' };
+  }
+  return { ok: false, code: code, message: 'Jira auth check failed: HTTP ' + code };
 }
 
 // ---------------------------------------------------------------------------
