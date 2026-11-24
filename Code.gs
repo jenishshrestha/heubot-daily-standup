@@ -1089,9 +1089,9 @@ function postDigest(meetingDate) {
     meetingDate = getTodayDate();
   }
 
-  var responses = getTodaysResponses(meetingDate);
-  var questions = getQuestions();
   var members = getActiveTeamMembers();
+  var responses = latestResponsePerMember(getTodaysResponses(meetingDate), members);
+  var questions = getQuestions();
   var settings = getAllSettings();
 
   var spaceId = settings['STANDUP_SPACE_ID'];
@@ -1167,6 +1167,24 @@ function postDigest(meetingDate) {
     + (repliesFailed ? ', ' + repliesFailed + ' replies failed' : ''));
 
   return { ok: true, reason: null, responseCount: responses.length };
+}
+
+/**
+ * One response per active member: the latest save wins, and rows whose
+ * email is not an active member are dropped. Guards the digest against
+ * duplicate rows, so "X of Y" can never count a person twice.
+ *
+ * @param {Array<Object>} responses - Rows ordered by responded_at asc
+ * @param {Array<Object>} members   - Active team members
+ * @returns {Array<Object>}
+ */
+function latestResponsePerMember(responses, members) {
+  const memberEmails = new Set(members.map(m => m.email));
+  const byEmail = new Map();
+  responses.forEach(r => {
+    if (memberEmails.has(r.email)) byEmail.set(r.email, r);
+  });
+  return Array.from(byEmail.values());
 }
 
 // ---------------------------------------------------------------------------
