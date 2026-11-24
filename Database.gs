@@ -174,19 +174,18 @@ function updateMemberChatUserId(email, chatUserId) {
 /**
  * Upsert a standup response for (date, email).
  *
- * Guarantees one row per user per day regardless of retries or accidental
- * double-clicks. We do an explicit check-then-write rather than relying
- * on a Postgres unique constraint, so it works against the existing
- * schema without a migration.
+ * One atomic INSERT ... ON CONFLICT (date, email) DO UPDATE, so a
+ * concurrent double submit or a supabaseRequest retry of a POST whose
+ * response was lost overwrites the same row instead of adding a second.
+ * A separate check-then-write could not guarantee that: two runs could
+ * both see "no row" and both insert.
+ *
+ * Needs the UNIQUE (date, email) constraint on standup_responses. If the
+ * live table lacks it, PostgREST answers 42P10 and we fall back to the
+ * non-atomic path, logging loudly so the index gets added.
  */
 function upsertStandupResponse(date, name, email, answers, jiraTickets) {
-  var existing = supabaseRequest('/rest/v1/standup_responses', {
-    query: 'date=eq.' + encodeURIComponent(date)
-      + '&email=eq.' + encodeURIComponent(email)
-      + '&select=id'
-  });
-
-  var payload = {
+  const payload = {
     date: date,
     name: name,
     email: email,
@@ -194,6 +193,28 @@ function upsertStandupResponse(date, name, email, answers, jiraTickets) {
     jira_tickets: jiraTickets,
     responded_at: new Date().toISOString()
   };
+
+  try {
+    return supabaseRequest('/rest/v1/standup_responses', {
+      method: 'POST',
+      query: 'on_conflict=date,email',
+      prefer: 'resolution=merge-duplicates,return=representation',
+      payload: payload
+    });
+  } catch (e) {
+    if (!e.message || e.message.indexOf('42P10') === -1) throw e;
+    Logger.log('WARNING: standup_responses has no UNIQUE (date, email) constraint. '
+      + 'Falling back to non-atomic upsert; duplicates are possible until it is added.');
+    return checkThenWriteStandupResponse_(date, email, payload);
+  }
+}
+
+function checkThenWriteStandupResponse_(date, email, payload) {
+  var existing = supabaseRequest('/rest/v1/standup_responses', {
+    query: 'date=eq.' + encodeURIComponent(date)
+      + '&email=eq.' + encodeURIComponent(email)
+      + '&select=id'
+  });
 
   if (existing && existing.length > 0) {
     return supabaseRequest('/rest/v1/standup_responses', {
